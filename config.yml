@@ -1,0 +1,8 @@
+---
+logs:
+  json: false
+metrics:
+  endpoint: 127.0.0.1:8001
+tokio:
+  worker_threads: 2
+  affinity: 0-1

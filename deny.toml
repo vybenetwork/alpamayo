@@ -1,0 +1,17 @@
+[graph]
+all-features = true
+
+[advisories]
+ignore = [
+    # ed25519-dalek 1.0.1
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2022-0093
+    "RUSTSEC-2022-0093",
+
+    # curve25519-dalek 3.2.0
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0344
+    "RUSTSEC-2024-0344",
+
+    # derivative 2.2.0
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2024-0388
+    "RUSTSEC-2024-0388",
+]
