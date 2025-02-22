@@ -14,15 +14,21 @@ publish = false
 anyhow = "1.0.96"
 clap = { version = "4.5.30", features = ["derive"] }
 futures = "0.3.31"
+humantime-serde = "1.1.1"
 json5 = "0.4.1"
 lazy_static = "1.4.0"
+maplit = "1.0.2"
 prometheus = "0.13.4"
+richat-client = "2.2.0"
+richat-proto = "2.1.0"
 richat-shared = { version = "2.5.0", default-features = false, features = ["config", "metrics", "shutdown", "version"] }
 serde = { version = "1.0.218", features = ["derive"] }
 serde_yaml = "0.9.33"
 signal-hook = "0.3.17"
+solana-rpc-client = "~2.1.14"
 thiserror = "2.0.11"
 tokio = "1.43.0"
+tonic = "0.12.3"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["ansi", "env-filter", "json"] }
 
