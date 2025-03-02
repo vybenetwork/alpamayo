@@ -12,6 +12,8 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.96"
+base64 = "0.22.1"
+bs58 = "0.5.1"
 clap = { version = "4.5.30", features = ["derive"] }
 futures = "0.3.31"
 humantime-serde = "1.1.1"
@@ -25,7 +27,10 @@ richat-shared = { version = "2.5.0", default-features = false, features = ["conf
 serde = { version = "1.0.218", features = ["derive"] }
 serde_yaml = "0.9.33"
 signal-hook = "0.3.17"
+solana-client = "~2.1.14"
 solana-rpc-client = "~2.1.14"
+solana-sdk = "~2.1.14"
+solana-transaction-status = "~2.1.14"
 thiserror = "2.0.11"
 tokio = "1.43.0"
 tonic = "0.12.3"

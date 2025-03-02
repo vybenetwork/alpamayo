@@ -1,5 +1,5 @@
 # project
-config.test.yml
+config.dev.yml
 
 # rust
 /target

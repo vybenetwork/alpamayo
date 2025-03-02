@@ -10,6 +10,7 @@ source:
   rpc:
     url: http://127.0.0.1:8899/
     timeout: 30s
+    concurrency: 10
   stream:
     source: richat # valid: richat, dragons_mouth
     endpoint: http://127.0.0.1:10000

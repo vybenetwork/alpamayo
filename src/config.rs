@@ -1,30 +1,13 @@
 use {
-    maplit::hashmap,
-    richat_client::{
-        grpc::{ConfigGrpcClient, GrpcClientBuilderError},
-        stream::SubscribeStream,
-    },
-    richat_proto::{
-        geyser::{
-            CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
-            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
-            SubscribeRequestFilterTransactions,
-        },
-        richat::{GrpcSubscribeRequest, RichatFilter},
-    },
-    richat_shared::config::ConfigTokio,
+    richat_client::grpc::ConfigGrpcClient,
+    richat_shared::config::{ConfigTokio, deserialize_num_str},
     serde::Deserialize,
-    solana_rpc_client::{
-        http_sender::HttpSender, nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig,
-    },
     std::{
-        collections::HashMap,
         fs,
         net::{IpAddr, Ipv4Addr, SocketAddr},
         path::Path,
         time::Duration,
     },
-    thiserror::Error,
 };
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -88,6 +71,8 @@ pub struct ConfigSourceRpc {
     pub url: String,
     #[serde(with = "humantime_serde")]
     pub timeout: Duration,
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub concurrency: usize,
 }
 
 impl Default for ConfigSourceRpc {
@@ -95,23 +80,9 @@ impl Default for ConfigSourceRpc {
         Self {
             url: "http://127.0.0.1:8899".to_owned(),
             timeout: Duration::from_secs(30),
+            concurrency: 10,
         }
     }
-}
-
-impl ConfigSourceRpc {
-    pub fn create_client(self) -> RpcClient {
-        let sender = HttpSender::new_with_timeout(self.url, self.timeout);
-        RpcClient::new_sender(sender, RpcClientConfig::default())
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum ConfigSourceStreamConnectError {
-    #[error(transparent)]
-    Build(#[from] GrpcClientBuilderError),
-    #[error(transparent)]
-    Connect(#[from] tonic::Status),
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -120,52 +91,6 @@ pub struct ConfigSourceStream {
     pub source: ConfigSourceStreamKind,
     #[serde(flatten)]
     pub config: ConfigGrpcClient,
-}
-
-impl ConfigSourceStream {
-    pub async fn connect(self) -> Result<SubscribeStream, ConfigSourceStreamConnectError> {
-        let mut connection = self.config.connect().await?;
-        Ok(match self.source {
-            ConfigSourceStreamKind::DragonsMouth => connection
-                .subscribe_dragons_mouth_once(Self::create_dragons_mouth_filter())
-                .await?
-                .into_parsed(),
-            ConfigSourceStreamKind::Richat => connection
-                .subscribe_richat(GrpcSubscribeRequest {
-                    replay_from_slot: None,
-                    filter: Self::create_richat_filter(),
-                })
-                .await?
-                .into_parsed(),
-        })
-    }
-
-    const fn create_richat_filter() -> Option<RichatFilter> {
-        Some(RichatFilter {
-            disable_accounts: true,
-            disable_transactions: false,
-            disable_entries: true,
-        })
-    }
-
-    fn create_dragons_mouth_filter() -> SubscribeRequest {
-        SubscribeRequest {
-            accounts: HashMap::new(),
-            slots: hashmap! { "".to_owned() => SubscribeRequestFilterSlots {
-                filter_by_commitment: Some(false),
-                interslot_updates: Some(true),
-            } },
-            transactions: hashmap! { "".to_owned() => SubscribeRequestFilterTransactions::default() },
-            transactions_status: HashMap::new(),
-            blocks: HashMap::new(),
-            blocks_meta: hashmap! { "".to_owned() => SubscribeRequestFilterBlocksMeta::default() },
-            entry: HashMap::new(),
-            commitment: Some(CommitmentLevelProto::Processed as i32),
-            accounts_data_slice: vec![],
-            ping: None,
-            from_slot: None,
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
