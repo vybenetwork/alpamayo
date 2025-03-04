@@ -1,8 +1,9 @@
 use {
-    alpamayo::config::Config,
+    alpamayo::{config::Config, metrics, storage},
     anyhow::Context,
     clap::Parser,
     futures::future::{FutureExt, TryFutureExt, ready, try_join_all},
+    glommio::channels::spsc_queue,
     richat_shared::shutdown::Shutdown,
     signal_hook::{consts::SIGINT, iterator::Signals},
     std::{
@@ -30,7 +31,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::load_from_file(&args.config)
+    let mut config = Config::load_from_file(&args.config)
         .with_context(|| format!("failed to load config from {}", args.config))?;
 
     // Setup logs
@@ -45,14 +46,33 @@ fn main() -> anyhow::Result<()> {
     // Shutdown channel/flag
     let shutdown = Shutdown::new();
 
+    // Create dirs for storage
+    let runtime = config.tokio.build_runtime("appTokioRt")?;
+    let config_storage = config.storage;
+    config.storage = runtime.block_on(async move {
+        config_storage.create_dir_all().await?;
+        Ok::<_, anyhow::Error>(config_storage)
+    })?;
+
+    // Create source / storage channels
+    let (stream_tx, stream_rx) = spsc_queue::make(2_048);
+
     // Create global runtime
-    let app_jh = thread::Builder::new().name("alpamayo".to_owned()).spawn({
+    let app_rt_jh = thread::Builder::new().name("appTokio".to_owned()).spawn({
         let shutdown = shutdown.clone();
         move || {
-            let runtime = config.tokio.build_runtime("alpamayo")?;
             runtime.block_on(async move {
+                let source_fut = tokio::spawn(storage::source::start(
+                    config.source,
+                    stream_tx,
+                    shutdown.clone(),
+                ))
+                .map_err(Into::into)
+                .and_then(ready)
+                .boxed();
+
                 let metrics_fut = if let Some(config) = config.metrics {
-                    alpamayo::metrics::spawn_server(config, shutdown)
+                    metrics::spawn_server(config, shutdown)
                         .await?
                         .map_err(anyhow::Error::from)
                         .boxed()
@@ -60,14 +80,22 @@ fn main() -> anyhow::Result<()> {
                     ready(Ok(())).boxed()
                 };
 
-                try_join_all(vec![metrics_fut]).await.map(|_| ())
+                try_join_all(vec![source_fut, metrics_fut])
+                    .await
+                    .map(|_| ())
             })
         }
     })?;
 
+    // Storage runtimes
+    let storage_write_jh = storage::write::start(config.storage, stream_rx, shutdown.clone())?;
+
     // Shutdown loop
     let mut signals = Signals::new([SIGINT])?;
-    let mut threads = [("app", Some(app_jh))];
+    let mut threads = [
+        ("appTokio", Some(app_rt_jh)),
+        ("storageWrite", Some(storage_write_jh)),
+    ];
     'outer: while threads.iter().any(|th| th.1.is_some()) {
         for signal in signals.pending() {
             match signal {

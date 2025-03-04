@@ -6,14 +6,14 @@ use {
     richat_proto::{
         convert_from::{create_reward, create_tx_with_meta},
         geyser::{
-            CommitmentLevel as CommitmentLevelProto, SubscribeRequest,
-            SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
+            CommitmentLevel as CommitmentLevelProto, SlotStatus as SlotStatusProto,
+            SubscribeRequest, SubscribeRequestFilterBlocksMeta, SubscribeRequestFilterSlots,
             SubscribeRequestFilterTransactions, SubscribeUpdate, SubscribeUpdateBlockMeta,
             SubscribeUpdateSlot, SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
         },
         richat::{GrpcSubscribeRequest, RichatFilter},
     },
-    solana_sdk::{clock::Slot, commitment_config::CommitmentLevel},
+    solana_sdk::clock::Slot,
     solana_transaction_status::{ConfirmedBlock, TransactionWithStatusMeta},
     std::{
         collections::{BTreeMap, HashMap},
@@ -21,7 +21,7 @@ use {
         task::{Context, Poll},
     },
     thiserror::Error,
-    tracing::{info, warn},
+    tracing::{error, info},
 };
 
 #[derive(Debug, Error)]
@@ -44,52 +44,50 @@ pub enum RecvError {
     UnknownCommitmentLevel(i32),
     #[error("parent slot is missed for: {0}")]
     MissedParent(Slot),
-    #[error("unexpected commitment level, {0} -> {1}")]
-    UnexpectedCommitment(CommitmentLevel, CommitmentLevel),
+    #[error("unexpected commitment level, {0:?} -> {1:?}")]
+    UnexpectedCommitment(SlotStatusProto, SlotStatusProto),
     #[error("failed to decode Transaction: {0}")]
     TransactionWithMetaFailed(&'static str),
     #[error("failed to build reward: {0}")]
     RewardsFailed(&'static str),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamSourceSlotStatus {
+    Dead,
+    Confirmed,
+    Finalized,
+}
+
 #[derive(Debug)]
 pub enum StreamSourceMessage {
-    SlotStatus {
-        slot: Slot,
-        parent: Slot,
-        status: CommitmentLevel,
-    },
     Block {
         slot: Slot,
         block: ConfirmedBlock,
+    },
+    SlotStatus {
+        slot: Slot,
+        parent: Slot,
+        status: StreamSourceSlotStatus,
     },
 }
 
 #[derive(Debug)]
 struct SlotInfo {
-    status: CommitmentLevel,
+    slot: Slot,
+    status: SlotStatusProto,
     parent: Option<Slot>,
-    transactions: Vec<TransactionWithStatusMeta>,
+    transactions: Vec<(u64, TransactionWithStatusMeta)>,
     block_meta: Option<SubscribeUpdateBlockMeta>,
     sealed: bool,
-}
-
-impl Default for SlotInfo {
-    fn default() -> Self {
-        Self {
-            status: CommitmentLevel::Processed,
-            parent: None,
-            transactions: Vec::with_capacity(8_192),
-            block_meta: None,
-            sealed: false,
-        }
-    }
+    ignore_block_build_fail: bool,
 }
 
 impl Drop for SlotInfo {
     fn drop(&mut self) {
-        if !self.sealed {
-            warn!(
+        if !self.sealed && !self.ignore_block_build_fail {
+            error!(
+                slot = self.slot,
                 status = ?self.status,
                 parent = self.parent,
                 transactions = self.transactions.len(),
@@ -104,18 +102,32 @@ impl Drop for SlotInfo {
 }
 
 impl SlotInfo {
+    fn new(slot: Slot) -> Self {
+        Self {
+            slot,
+            status: SlotStatusProto::SlotProcessed,
+            parent: None,
+            transactions: Vec::with_capacity(8_192),
+            block_meta: None,
+            sealed: false,
+            ignore_block_build_fail: false,
+        }
+    }
+
     fn try_build_block(&mut self) -> Option<Result<ConfirmedBlock, RecvError>> {
-        if self.parent.is_none()
+        if self.sealed
             || self
                 .block_meta
                 .as_ref()
                 .map(|bm| bm.executed_transaction_count)
                 != Some(self.transactions.len() as u64)
-            || self.sealed
         {
             return None;
         }
         self.sealed = true;
+
+        let mut transactions = std::mem::take(&mut self.transactions);
+        transactions.sort_unstable_by_key(|(index, _tx)| *index);
 
         let block_meta = self.block_meta.take()?;
         let (rewards, num_partitions) = match block_meta.rewards {
@@ -137,7 +149,7 @@ impl SlotInfo {
             previous_blockhash: block_meta.parent_blockhash,
             blockhash: block_meta.blockhash,
             parent_slot: block_meta.parent_slot,
-            transactions: std::mem::take(&mut self.transactions),
+            transactions: transactions.into_iter().map(|(_index, tx)| tx).collect(),
             rewards,
             num_partitions,
             block_time: block_meta.block_time.map(|obj| obj.timestamp),
@@ -150,6 +162,7 @@ impl SlotInfo {
 pub struct StreamSource {
     stream: SubscribeStream,
     slots: BTreeMap<Slot, SlotInfo>,
+    first_processed: Option<Slot>,
 }
 
 impl StreamSource {
@@ -176,6 +189,7 @@ impl StreamSource {
         Ok(Self {
             stream,
             slots: BTreeMap::new(),
+            first_processed: None,
         })
     }
 
@@ -192,7 +206,7 @@ impl StreamSource {
             accounts: HashMap::new(),
             slots: hashmap! { "".to_owned() => SubscribeRequestFilterSlots {
                 filter_by_commitment: Some(false),
-                interslot_updates: Some(false),
+                interslot_updates: Some(true),
             } },
             transactions: hashmap! { "".to_owned() => SubscribeRequestFilterTransactions::default() },
             transactions_status: HashMap::new(),
@@ -222,10 +236,14 @@ impl Stream for StreamSource {
                         status,
                         ..
                     })) => {
-                        let status = match CommitmentLevelProto::try_from(status) {
-                            Ok(CommitmentLevelProto::Processed) => CommitmentLevel::Processed,
-                            Ok(CommitmentLevelProto::Confirmed) => CommitmentLevel::Confirmed,
-                            Ok(CommitmentLevelProto::Finalized) => CommitmentLevel::Finalized,
+                        let status = match SlotStatusProto::try_from(status) {
+                            Ok(SlotStatusProto::SlotProcessed) => SlotStatusProto::SlotProcessed,
+                            Ok(SlotStatusProto::SlotConfirmed) => SlotStatusProto::SlotConfirmed,
+                            Ok(SlotStatusProto::SlotFinalized) => SlotStatusProto::SlotFinalized,
+                            Ok(SlotStatusProto::SlotFirstShredReceived) => continue,
+                            Ok(SlotStatusProto::SlotCompleted) => continue,
+                            Ok(SlotStatusProto::SlotCreatedBank) => continue,
+                            Ok(SlotStatusProto::SlotDead) => SlotStatusProto::SlotDead,
                             Err(_error) => {
                                 return Poll::Ready(Some(Err(RecvError::UnknownCommitmentLevel(
                                     status,
@@ -233,53 +251,93 @@ impl Stream for StreamSource {
                             }
                         };
 
+                        // store first processed slot
+                        if status == SlotStatusProto::SlotProcessed
+                            && this.first_processed.is_none()
+                        {
+                            this.first_processed = Some(slot);
+                        }
+
+                        // drop message if less or eq to first processed
+                        let Some(first_processed) = this.first_processed else {
+                            continue;
+                        };
+                        if slot <= first_processed {
+                            continue;
+                        }
+
                         // drop outdated slots
-                        if status == CommitmentLevel::Finalized {
+                        if status == SlotStatusProto::SlotFinalized {
                             loop {
                                 match this.slots.keys().next().copied() {
                                     Some(slot_first) if slot_first < slot => {
-                                        this.slots.remove(&slot_first);
+                                        if let Some(mut slot_info) = this.slots.remove(&slot_first)
+                                        {
+                                            // ignore warn message if we expect that block would not be complete
+                                            if slot_first <= first_processed {
+                                                slot_info.ignore_block_build_fail = true;
+                                            }
+                                            drop(slot_info);
+                                        }
                                     }
                                     _ => break,
                                 }
                             }
                         }
 
-                        // update status
-                        let entry = this.slots.entry(slot).or_default();
-                        let parent = match (entry.parent, entry.status, status) {
-                            (None, CommitmentLevel::Processed, CommitmentLevel::Processed) => {
-                                match parent {
-                                    Some(parent) => {
-                                        entry.parent = Some(parent);
-                                        parent
-                                    }
-                                    None => {
-                                        return Poll::Ready(Some(Err(RecvError::MissedParent(
-                                            slot,
-                                        ))));
-                                    }
+                        // create slot info
+                        let entry = this.slots.entry(slot);
+                        let slot_info = entry.or_insert_with(|| SlotInfo::new(slot));
+
+                        // store parent and drop message (only processed)
+                        if status == SlotStatusProto::SlotProcessed {
+                            if slot_info.parent.is_none()
+                                && slot_info.status == SlotStatusProto::SlotProcessed
+                            {
+                                if let Some(parent) = parent {
+                                    slot_info.parent = Some(parent);
+                                    continue;
                                 }
                             }
+
+                            if first_processed <= slot {
+                                return Poll::Ready(Some(Err(RecvError::UnexpectedCommitment(
+                                    slot_info.status,
+                                    status,
+                                ))));
+                            }
+                            continue;
+                        }
+
+                        // update status
+                        let parent = match (slot_info.parent, slot_info.status, status) {
                             (
                                 Some(parent),
-                                CommitmentLevel::Processed,
-                                CommitmentLevel::Confirmed,
+                                SlotStatusProto::SlotProcessed,
+                                SlotStatusProto::SlotDead,
                             ) => {
-                                entry.status = CommitmentLevel::Confirmed;
+                                slot_info.status = SlotStatusProto::SlotDead;
                                 parent
                             }
                             (
                                 Some(parent),
-                                CommitmentLevel::Confirmed,
-                                CommitmentLevel::Finalized,
+                                SlotStatusProto::SlotProcessed,
+                                SlotStatusProto::SlotConfirmed,
                             ) => {
-                                entry.status = CommitmentLevel::Finalized;
+                                slot_info.status = SlotStatusProto::SlotConfirmed;
+                                parent
+                            }
+                            (
+                                Some(parent),
+                                SlotStatusProto::SlotConfirmed,
+                                SlotStatusProto::SlotFinalized,
+                            ) => {
+                                slot_info.status = SlotStatusProto::SlotFinalized;
                                 parent
                             }
                             _ => {
                                 return Poll::Ready(Some(Err(RecvError::UnexpectedCommitment(
-                                    entry.status,
+                                    slot_info.status,
                                     status,
                                 ))));
                             }
@@ -288,7 +346,12 @@ impl Stream for StreamSource {
                         Ok(StreamSourceMessage::SlotStatus {
                             slot,
                             parent,
-                            status,
+                            status: match status {
+                                SlotStatusProto::SlotDead => StreamSourceSlotStatus::Dead,
+                                SlotStatusProto::SlotConfirmed => StreamSourceSlotStatus::Confirmed,
+                                SlotStatusProto::SlotFinalized => StreamSourceSlotStatus::Finalized,
+                                _ => unreachable!(),
+                            },
                         })
                     }
                     Some(UpdateOneof::Transaction(SubscribeUpdateTransaction {
@@ -296,11 +359,19 @@ impl Stream for StreamSource {
                         slot,
                     })) => match transaction {
                         Some(tx) => {
-                            let entry = this.slots.entry(slot).or_default();
+                            let first_processed = this.first_processed;
+                            let entry = this.slots.entry(slot);
+                            let slot_info = entry.or_insert_with(|| SlotInfo::new(slot));
+                            let index = tx.index;
                             match create_tx_with_meta(tx) {
                                 Ok(tx) => {
-                                    entry.transactions.push(tx);
-                                    match entry.try_build_block() {
+                                    slot_info.transactions.push((index, tx));
+                                    if let Some(first_processed) = first_processed {
+                                        if slot <= first_processed {
+                                            continue;
+                                        }
+                                    }
+                                    match slot_info.try_build_block() {
                                         Some(Ok(block)) => {
                                             Ok(StreamSourceMessage::Block { slot, block })
                                         }
@@ -321,9 +392,16 @@ impl Stream for StreamSource {
                     Some(UpdateOneof::Pong(_)) => Err(RecvError::UnexpectedMessage("Pong")),
                     Some(UpdateOneof::BlockMeta(block_meta)) => {
                         let slot = block_meta.slot;
-                        let entry = this.slots.entry(slot).or_default();
-                        entry.block_meta = Some(block_meta);
-                        match entry.try_build_block() {
+                        let first_processed = this.first_processed;
+                        let entry = this.slots.entry(slot);
+                        let slot_info = entry.or_insert_with(|| SlotInfo::new(slot));
+                        slot_info.block_meta = Some(block_meta);
+                        if let Some(first_processed) = first_processed {
+                            if slot <= first_processed {
+                                continue;
+                            }
+                        }
+                        match slot_info.try_build_block() {
                             Some(Ok(block)) => Ok(StreamSourceMessage::Block { slot, block }),
                             Some(Err(error)) => Err(error),
                             None => continue,
