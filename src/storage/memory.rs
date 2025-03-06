@@ -17,6 +17,14 @@ impl MemoryConfirmedBlock {
             Self::Missed { slot }
         }
     }
+
+    pub fn get_slot(&self) -> Slot {
+        *match self {
+            Self::Missed { slot } => slot,
+            Self::Dead { slot } => slot,
+            Self::Block { slot, .. } => slot,
+        }
+    }
 }
 
 #[derive(Debug)]

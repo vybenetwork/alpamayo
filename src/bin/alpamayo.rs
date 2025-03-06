@@ -3,13 +3,13 @@ use {
     anyhow::Context,
     clap::Parser,
     futures::future::{FutureExt, TryFutureExt, ready, try_join_all},
-    glommio::channels::spsc_queue,
     richat_shared::shutdown::Shutdown,
     signal_hook::{consts::SIGINT, iterator::Signals},
     std::{
         thread::{self, sleep},
         time::Duration,
     },
+    tokio::sync::mpsc,
     tracing::{info, warn},
 };
 
@@ -55,7 +55,8 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Create source / storage channels
-    let (stream_tx, stream_rx) = spsc_queue::make(2_048);
+    let (stream_tx, stream_rx) = mpsc::channel(2_048);
+    let (rpc_tx, rpc_rx) = mpsc::channel(2_048);
 
     // Create global runtime
     let app_rt_jh = thread::Builder::new().name("appTokio".to_owned()).spawn({
@@ -64,6 +65,7 @@ fn main() -> anyhow::Result<()> {
             runtime.block_on(async move {
                 let source_fut = tokio::spawn(storage::source::start(
                     config.source,
+                    rpc_rx,
                     stream_tx,
                     shutdown.clone(),
                 ))
@@ -88,7 +90,8 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Storage runtimes
-    let storage_write_jh = storage::write::start(config.storage, stream_rx, shutdown.clone())?;
+    let storage_write_jh =
+        storage::write::start(config.storage, rpc_tx, stream_rx, shutdown.clone())?;
 
     // Shutdown loop
     let mut signals = Signals::new([SIGINT])?;

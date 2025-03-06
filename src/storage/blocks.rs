@@ -6,6 +6,7 @@ use {
         io::{DmaFile, OpenOptions},
     },
     solana_sdk::clock::Slot,
+    solana_transaction_status::ConfirmedBlock,
     std::io,
     thiserror::Error,
 };
@@ -66,10 +67,6 @@ impl StoredBlockHeaders {
         } else {
             unimplemented!("allocate");
         };
-
-        if head != 0 {
-            unimplemented!("only initialization supported atm");
-        }
 
         Ok(Self {
             file,
@@ -137,6 +134,11 @@ impl StoredBlockHeaders {
     pub fn get_latest_slot(&self) -> Option<Slot> {
         let block = self.blocks[self.head];
         block.exists.then_some(block.slot)
+    }
+
+    pub fn push_block(&self, slot: Slot, block: Option<ConfirmedBlock>) {
+        tracing::info!("new block #{slot} block {:?}", block.is_some());
+        // TODO
     }
 }
 

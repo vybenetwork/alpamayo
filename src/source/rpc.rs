@@ -99,6 +99,13 @@ impl RpcSource {
         })
     }
 
+    pub async fn get_confirmed_slot(&self) -> Result<Slot, ClientError> {
+        let _permit = self.semaphore.acquire().await.expect("unclosed");
+        self.client
+            .get_slot_with_commitment(CommitmentConfig::confirmed())
+            .await
+    }
+
     pub async fn get_block(&self, slot: Slot) -> Result<ConfirmedBlock, GetBlockError> {
         let config = RpcBlockConfig {
             encoding: Some(UiTransactionEncoding::Base64),
@@ -114,6 +121,7 @@ impl RpcSource {
 
         let block = match response {
             Ok(block) => block,
+            // not confirmed yet?
             Err(ClientError {
                 kind:
                     ClientErrorKind::RpcError(RpcError::RpcResponseError {
@@ -124,6 +132,7 @@ impl RpcSource {
             }) => {
                 return Err(GetBlockError::BlockNotAvailable(slot));
             }
+            // dead
             Err(ClientError {
                 kind:
                     ClientErrorKind::RpcError(RpcError::RpcResponseError {

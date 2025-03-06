@@ -115,14 +115,14 @@ pub enum ConfigSourceStreamKind {
 #[serde(deny_unknown_fields)]
 pub struct ConfigStorage {
     pub blocks: ConfigStorageBlocks,
-    pub dma_files: Vec<ConfigStorageDmaFile>,
+    pub files: Vec<ConfigStorageFile>,
 }
 
 impl ConfigStorage {
     pub async fn create_dir_all(&self) -> anyhow::Result<()> {
         Self::create_dir_all2(&self.blocks.path).await?;
-        for dma_file in self.dma_files.iter() {
-            Self::create_dir_all2(&dma_file.path).await?
+        for file in self.files.iter() {
+            Self::create_dir_all2(&file.path).await?
         }
         Ok(())
     }
@@ -143,11 +143,40 @@ pub struct ConfigStorageBlocks {
     #[serde(deserialize_with = "deserialize_num_str")]
     pub max: usize,
     pub path: PathBuf,
+    #[serde(
+        deserialize_with = "deserialize_num_str",
+        default = "ConfigStorageBlocks::default_rpc_getblock_max_retries"
+    )]
+    pub rpc_getblock_max_retries: usize,
+    #[serde(
+        with = "humantime_serde",
+        default = "ConfigStorageBlocks::default_rpc_getblock_backoff_init"
+    )]
+    pub rpc_getblock_backoff_init: Duration,
+    #[serde(
+        deserialize_with = "deserialize_num_str",
+        default = "ConfigStorageBlocks::default_rpc_getblock_max_concurrency"
+    )]
+    pub rpc_getblock_max_concurrency: usize,
+}
+
+impl ConfigStorageBlocks {
+    const fn default_rpc_getblock_max_retries() -> usize {
+        10
+    }
+
+    const fn default_rpc_getblock_backoff_init() -> Duration {
+        Duration::from_millis(100)
+    }
+
+    const fn default_rpc_getblock_max_concurrency() -> usize {
+        15
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ConfigStorageDmaFile {
+pub struct ConfigStorageFile {
     pub id: u32,
     pub path: PathBuf,
     #[serde(deserialize_with = "deserialize_humansize")]
