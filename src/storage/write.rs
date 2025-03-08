@@ -8,7 +8,7 @@ use {
         },
         storage::{
             blocks::StoredBlockHeaders,
-            files::Files,
+            files::StorageFiles,
             memory::{MemoryConfirmedBlock, MemoryStorage},
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
@@ -17,15 +17,14 @@ use {
         future::{FutureExt, pending},
         stream::{FuturesUnordered, StreamExt},
     },
-    glommio::{LocalExecutorBuilder, Placement, Task, spawn_local, timer::sleep},
     richat_shared::shutdown::Shutdown,
     solana_sdk::clock::Slot,
-    std::{
-        collections::HashMap,
-        thread::{Builder, JoinHandle},
-        time::Duration,
+    std::{collections::HashMap, thread, time::Duration},
+    tokio::{
+        sync::mpsc,
+        task::{JoinHandle, spawn_local},
+        time::sleep,
     },
-    tokio::sync::mpsc,
     tracing::error,
 };
 
@@ -34,38 +33,54 @@ pub fn start(
     rpc_tx: mpsc::Sender<RpcRequest>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
     shutdown: Shutdown,
-) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
-    Builder::new()
+) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
+    thread::Builder::new()
         .name("storageWrite".to_owned())
         .spawn(move || {
-            let ex = LocalExecutorBuilder::new(Placement::Unbound) // TODO, add placement?
-                .name("storageWriteRt")
-                .io_memory(10 << 20)
-                .ring_depth(128)
-                .preempt_timer(Duration::from_millis(100))
-                .make()
-                .map_err(|error| anyhow::anyhow!("failed to create LocalExecutor: {error}"))?;
+            tokio_uring::start(async move {
+                let rpc_getblock_max_retries = config.blocks.rpc_getblock_max_retries;
+                let rpc_getblock_backoff_init = config.blocks.rpc_getblock_backoff_init;
+                let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
+                let rpc = RpcSourceConnected::new(rpc_tx);
 
-            ex.run(start2(config, rpc_tx, stream_rx, shutdown))
+                let mut blocks = StoredBlockHeaders::open(config.blocks).await?;
+                let mut files = StorageFiles::open(config.files, &blocks).await?;
+                let memory_storage = MemoryStorage::default();
+
+                let result = start2(
+                    rpc_getblock_max_retries,
+                    rpc_getblock_backoff_init,
+                    rpc_getblock_max_concurrency,
+                    rpc,
+                    stream_rx,
+                    &mut blocks,
+                    &mut files,
+                    memory_storage,
+                    shutdown,
+                )
+                .await;
+
+                blocks.close().await;
+                files.close().await;
+
+                result
+            })
         })
         .map_err(Into::into)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start2(
-    config: ConfigStorage,
-    rpc_tx: mpsc::Sender<RpcRequest>,
+    rpc_getblock_max_retries: usize,
+    rpc_getblock_backoff_init: Duration,
+    rpc_getblock_max_concurrency: usize,
+    rpc: RpcSourceConnected,
     mut stream_rx: mpsc::Receiver<StreamSourceMessage>,
+    blocks: &mut StoredBlockHeaders,
+    files: &mut StorageFiles,
+    mut memory_storage: MemoryStorage,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    let rpc_getblock_max_retries = config.blocks.rpc_getblock_max_retries;
-    let rpc_getblock_backoff_init = config.blocks.rpc_getblock_backoff_init;
-    let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
-    let rpc = RpcSourceConnected::new(rpc_tx);
-
-    let mut blocks = StoredBlockHeaders::open(config.blocks).await?;
-    let mut files = Files::open(config.files, &blocks).await?;
-    let mut memory_storage = MemoryStorage::default();
-
     // fill the gap between stored and new
     let mut next_confirmed_slot = rpc.get_slot_confirmed().await?;
     if let Some(_slot) = blocks.get_latest_slot() {
@@ -75,7 +90,7 @@ async fn start2(
     let mut requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
     let get_confirmed_block = |requests: &mut FuturesUnordered<
-        Task<
+        JoinHandle<
             Result<(u64, Option<ConfirmedBlockWithBinary>), RpcSourceConnectedError<GetBlockError>>,
         >,
     >,
@@ -122,11 +137,15 @@ async fn start2(
             () = &mut shutdown => return Ok(()),
             // insert block requested from rpc
             message = requests_next => match message {
-                Some(Ok((slot, block))) => {
+                Some(Ok(Ok((slot, block)))) => {
                     queued_slots.insert(slot, block);
                 },
-                Some(Err(error)) => {
+                Some(Ok(Err(error))) => {
                     error!(?error, "failed to get confirmed block");
+                    break;
+                },
+                Some(Err(error)) => {
+                    error!(?error, "failed to join spawned task");
                     break;
                 },
                 None => unreachable!(),
@@ -187,9 +206,7 @@ async fn start2(
 
         // save blocks
         while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
-            files
-                .push_block(next_confirmed_slot, block.as_ref(), &mut blocks)
-                .await?;
+            files.push_block(next_confirmed_slot, block, blocks).await?;
             next_confirmed_slot += 1;
         }
     }

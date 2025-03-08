@@ -31,7 +31,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let mut config = Config::load_from_file(&args.config)
+    let config = Config::load_from_file(&args.config)
         .with_context(|| format!("failed to load config from {}", args.config))?;
 
     // Setup logs
@@ -46,14 +46,6 @@ fn main() -> anyhow::Result<()> {
     // Shutdown channel/flag
     let shutdown = Shutdown::new();
 
-    // Create dirs for storage
-    let runtime = config.tokio.build_runtime("appTokioRt")?;
-    let config_storage = config.storage;
-    config.storage = runtime.block_on(async move {
-        config_storage.create_dir_all().await?;
-        Ok::<_, anyhow::Error>(config_storage)
-    })?;
-
     // Create source / storage channels
     let (stream_tx, stream_rx) = mpsc::channel(2_048);
     let (rpc_tx, rpc_rx) = mpsc::channel(2_048);
@@ -62,6 +54,7 @@ fn main() -> anyhow::Result<()> {
     let app_rt_jh = thread::Builder::new().name("appTokio".to_owned()).spawn({
         let shutdown = shutdown.clone();
         move || {
+            let runtime = config.tokio.build_runtime("appTokioRt")?;
             runtime.block_on(async move {
                 let source_fut = tokio::spawn(storage::source::start(
                     config.source,

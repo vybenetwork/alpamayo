@@ -2,27 +2,25 @@ use {
     crate::{
         config::ConfigStorageFile,
         source::block::ConfirmedBlockWithBinary,
-        storage::{blocks::StoredBlockHeaders, error::glommio_io_error},
+        storage::{blocks::StoredBlockHeaders, util},
     },
-    futures::future::try_join_all,
-    glommio::{
-        GlommioError,
-        io::{DmaFile, OpenOptions},
-    },
+    anyhow::Context,
+    futures::future::{join_all, try_join_all},
     solana_sdk::clock::Slot,
-    std::{collections::HashMap, path::PathBuf},
+    std::{collections::HashMap, io, path::PathBuf},
+    tokio_uring::fs::File,
 };
 
 pub type StorageId = u32;
 
 #[derive(Debug)]
-pub struct Files {
-    files: Vec<File>,
+pub struct StorageFiles {
+    files: Vec<StorageFile>,
     id2file: HashMap<StorageId, usize>,
     next_file: usize,
 }
 
-impl Files {
+impl StorageFiles {
     pub async fn open(
         configs: Vec<ConfigStorageFile>,
         blocks: &StoredBlockHeaders,
@@ -41,12 +39,13 @@ impl Files {
         for (storage_id, index) in id2file.iter() {
             if let Some(boundaries) = boundaries.remove(storage_id) {
                 let file = &mut files[*index];
-                file.tail = file.file.align_up(boundaries.tail().unwrap_or_default());
+                file.tail = boundaries.tail().unwrap_or_default();
                 anyhow::ensure!(file.tail < file.size, "invalid tail for {:?}", file.path);
-                file.head = file.file.align_up(boundaries.head().unwrap_or_default());
+                file.head = boundaries.head().unwrap_or_default();
                 anyhow::ensure!(file.head <= file.size, "invalid head for {:?}", file.path);
             }
         }
+        anyhow::ensure!(boundaries.is_empty(), "file storage is missed");
 
         Ok(Self {
             files,
@@ -55,25 +54,16 @@ impl Files {
         })
     }
 
-    async fn open_file(config: ConfigStorageFile) -> anyhow::Result<File> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .dma_open(&config.path)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to open file {:?}: {error:?}", config.path))?;
+    async fn open_file(config: ConfigStorageFile) -> anyhow::Result<StorageFile> {
+        let (file, file_size) = util::open(&config.path).await?;
 
         // verify file size
-        let file_size = file.file_size().await.map_err(|error| {
-            anyhow::anyhow!("failed to get file size {:?}: {error:?}", config.path)
-        })?;
         if file_size == 0 {
-            file.pre_allocate(config.size, false)
+            let ts = std::time::SystemTime::now();
+            file.fallocate(0, config.size, libc::FALLOC_FL_ZERO_RANGE)
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to preallocate {:?}: {error:?}", config.path)
-                })?;
+                .with_context(|| format!("failed to preallocate {:?}", config.path))?;
+            tracing::error!("fallocate, elapsed: {:?}", ts.elapsed().unwrap());
         } else if config.size != file_size {
             anyhow::bail!(
                 "invalid file size {:?}: {file_size} (expected: {})",
@@ -82,7 +72,7 @@ impl Files {
             );
         }
 
-        Ok(File {
+        Ok(StorageFile {
             id: config.id,
             path: config.path,
             file,
@@ -92,23 +82,31 @@ impl Files {
         })
     }
 
+    pub async fn close(self) {
+        join_all(self.files.into_iter().map(|file| async move {
+            let _: io::Result<()> = file.file.close().await;
+        }))
+        .await;
+    }
+
     pub async fn push_block(
         &mut self,
         slot: Slot,
-        block: Option<&ConfirmedBlockWithBinary>,
+        block: Option<ConfirmedBlockWithBinary>,
         blocks: &mut StoredBlockHeaders,
     ) -> anyhow::Result<()> {
         if blocks.is_full() {
             todo!() // remove block
         }
 
-        let Some(block) = block else {
+        let Some(mut block) = block else {
             return blocks.push_block_dead(slot).await;
         };
+        let buffer = block.take_buffer();
+        let buffer_size = buffer.len() as u64;
 
-        let size = block.get_blob().len() as u64;
         let file_index = loop {
-            match self.get_file_index_for_new_block(size) {
+            match self.get_file_index_for_new_block(buffer_size) {
                 Some(index) => break index,
                 None => {
                     todo!() // remove block
@@ -118,12 +116,13 @@ impl Files {
 
         let file = &mut self.files[file_index];
         let offset = file.head;
-        file.write_blob(block.get_blob()).await.map_err(|error| {
-            anyhow::anyhow!("failed to write block to file {:?}: {error:?}", file.path)
-        })?;
+        let _buffer = file
+            .write(buffer)
+            .await
+            .with_context(|| format!("failed to write block to file {:?}", file.path))?;
 
         blocks
-            .push_block_confirmed(slot, block, file.id, offset)
+            .push_block_confirmed(slot, block.block_time, file.id, offset, buffer_size)
             .await
     }
 
@@ -133,8 +132,7 @@ impl Files {
             let index = self.next_file;
             self.next_file = (self.next_file + 1) % self.files.len();
 
-            let aligned_size = self.files[index].file.align_up(size);
-            if self.files[index].free_space() >= aligned_size {
+            if self.files[index].free_space() >= size {
                 return Some(index);
             }
 
@@ -146,16 +144,16 @@ impl Files {
 }
 
 #[derive(Debug)]
-struct File {
+struct StorageFile {
     id: StorageId,
     path: PathBuf,
-    file: DmaFile,
+    file: File,
     tail: u64,
     head: u64,
     size: u64,
 }
 
-impl File {
+impl StorageFile {
     fn free_space(&self) -> u64 {
         if self.head < self.tail {
             self.tail - self.head
@@ -164,21 +162,11 @@ impl File {
         }
     }
 
-    async fn write_blob(&mut self, blob: &[u8]) -> Result<(), GlommioError<()>> {
-        if self.free_space() < blob.len() as u64 {
-            return Err(glommio_io_error("not enough space"));
-        }
+    async fn write(&mut self, buffer: Vec<u8>) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(self.free_space() >= buffer.len() as u64, "not enough space");
 
-        let size = self.file.align_up(blob.len() as u64);
-        let mut buffer = self.file.alloc_dma_buffer(size as usize);
-        buffer.as_bytes_mut()[0..blob.len()].copy_from_slice(blob);
-
-        let res = self.file.write_at(buffer, self.head).await?;
-        if res == size as usize {
-            self.head = (self.head + size) % self.size;
-            Ok(())
-        } else {
-            Err(glommio_io_error("invalid write size"))
-        }
+        let (result, buffer) = self.file.write_all_at(buffer, self.head).await;
+        let () = result?;
+        Ok(buffer)
     }
 }

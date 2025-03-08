@@ -14,7 +14,6 @@ use {
         str::FromStr,
         time::Duration,
     },
-    tokio::fs,
 };
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,25 +116,6 @@ pub enum ConfigSourceStreamKind {
 pub struct ConfigStorage {
     pub blocks: ConfigStorageBlocks,
     pub files: Vec<ConfigStorageFile>,
-}
-
-impl ConfigStorage {
-    pub async fn create_dir_all(&self) -> anyhow::Result<()> {
-        Self::create_dir_all2(&self.blocks.path).await?;
-        for file in self.files.iter() {
-            Self::create_dir_all2(&file.path).await?
-        }
-        Ok(())
-    }
-
-    async fn create_dir_all2(path: &Path) -> anyhow::Result<()> {
-        if let Some(path) = path.parent() {
-            fs::create_dir_all(path).await.map_err(|error| {
-                anyhow::anyhow!("failed to create dirs on path {path:?} with error: {error}")
-            })?;
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

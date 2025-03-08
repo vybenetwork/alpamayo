@@ -1,135 +1,88 @@
 use {
     crate::{
         config::ConfigStorageBlocks,
-        source::block::ConfirmedBlockWithBinary,
-        storage::{error::glommio_io_error, files::StorageId},
+        storage::{files::StorageId, util},
     },
+    anyhow::Context,
     bitflags::bitflags,
-    glommio::{
-        GlommioError,
-        io::{DmaFile, OpenOptions},
-    },
     solana_sdk::clock::{Slot, UnixTimestamp},
-    std::collections::HashMap,
+    std::{collections::HashMap, io},
     thiserror::Error,
+    tokio_uring::fs::File,
 };
-
-fn align_down_usize(v: usize, align: usize) -> usize {
-    v & !(align - 1)
-}
 
 #[derive(Debug)]
 pub struct StoredBlockHeaders {
-    file: DmaFile,
-    blocks_alignment: usize,
+    file: File,
     blocks: Vec<StoredBlockHeader>,
     head: usize,
 }
 
 impl StoredBlockHeaders {
     pub async fn open(config: ConfigStorageBlocks) -> anyhow::Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .dma_open(&config.path)
-            .await
-            .map_err(|error| anyhow::anyhow!("failed to open file {:?}: {error:?}", config.path))?;
-
-        // verify alignment
-        anyhow::ensure!(
-            file.alignment() as usize % StoredBlockHeader::BYTES_SIZE == 0,
-            "alignment {} is not supported",
-            file.alignment()
-        );
-        let blocks_alignment = file.alignment() as usize / StoredBlockHeader::BYTES_SIZE;
-
-        // verify file size
-        let file_size_current = file.file_size().await.map_err(|error| {
-            anyhow::anyhow!("failed to get file size {:?}: {error:?}", config.path)
-        })?;
-        anyhow::ensure!(
-            file_size_current % file.alignment() == 0,
-            "invalid file size {file_size_current} for alignment {}",
-            file.alignment()
-        );
+        let (file, file_size_current) = util::open(&config.path).await?;
 
         // init, truncate, load, allocate
-        let file_size_expected = file.align_up((config.max * StoredBlockHeader::BYTES_SIZE) as u64);
+        let file_size_expected = (config.max * StoredBlockHeader::BYTES_SIZE) as u64;
         let (blocks, head) = if file_size_current == 0 {
-            let blocks = Self::open_init(&file, file_size_expected as usize)
+            let blocks = Self::open_init(&file, config.max)
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to init file {:?}: {error:?}", config.path)
-                })?;
+                .with_context(|| format!("failed to init file {:?}", config.path))?;
             (blocks, 0)
         } else if file_size_current < file_size_expected {
             unimplemented!("truncate");
         } else if file_size_current == file_size_expected {
-            Self::open_load(&file, file_size_expected as usize)
+            Self::open_load(&file, config.max)
                 .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to load file {:?}: {error:?}", config.path)
-                })?
+                .with_context(|| format!("failed to load file {:?}", config.path))?
         } else {
             unimplemented!("allocate");
         };
 
-        Ok(Self {
-            file,
-            blocks_alignment,
-            blocks,
-            head,
-        })
+        Ok(Self { file, blocks, head })
     }
 
-    async fn open_init(
-        file: &DmaFile,
-        file_size: usize,
-    ) -> Result<Vec<StoredBlockHeader>, GlommioError<()>> {
-        let max = file_size / StoredBlockHeader::BYTES_SIZE;
-        let mut buffer = file.alloc_dma_buffer(file_size);
-
+    async fn open_init(file: &File, max: usize) -> io::Result<Vec<StoredBlockHeader>> {
+        let mut buffer = vec![0; max * StoredBlockHeader::BYTES_SIZE];
         let blocks = vec![StoredBlockHeader::default(); max];
         for (index, block) in blocks.iter().enumerate() {
             let offset = index * StoredBlockHeader::BYTES_SIZE;
-            let bytes = &mut buffer.as_bytes_mut()[offset..offset + StoredBlockHeader::BYTES_SIZE];
+            let bytes = &mut buffer[offset..offset + StoredBlockHeader::BYTES_SIZE];
             block.copy_to_slice(bytes).expect("valid slice len");
         }
 
-        let res = file.write_at(buffer, 0).await?;
-        if res == file_size {
-            Ok(blocks)
-        } else {
-            Err(glommio_io_error("invalid write size"))
-        }
+        let (result, _buffer) = file.write_all_at(buffer, 0).await;
+        let () = result?;
+
+        Ok(blocks)
     }
 
-    async fn open_load(
-        file: &DmaFile,
-        file_size: usize,
-    ) -> Result<(Vec<StoredBlockHeader>, usize), GlommioError<()>> {
-        let buf = file.read_at_aligned(0, file_size).await?;
-        match (0..file_size / StoredBlockHeader::BYTES_SIZE)
+    async fn open_load(file: &File, max: usize) -> anyhow::Result<(Vec<StoredBlockHeader>, usize)> {
+        let buffer = Vec::with_capacity(max * StoredBlockHeader::BYTES_SIZE);
+        let (result, buffer) = file.read_exact_at(buffer, 0).await;
+        let () = result?;
+
+        let blocks = (0..max)
             .map(|index| {
                 let offset = index * StoredBlockHeader::BYTES_SIZE;
-                let bytes = &buf[offset..offset + StoredBlockHeader::BYTES_SIZE];
+                let bytes = &buffer[offset..offset + StoredBlockHeader::BYTES_SIZE];
                 StoredBlockHeader::from_bytes(bytes)
             })
             .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(blocks) => {
-                let head = blocks
-                    .iter()
-                    .enumerate()
-                    .filter(|(_index, block)| block.exists && !block.dead)
-                    .max_by_key(|(_index, block)| block.slot)
-                    .map(|(index, _block)| index)
-                    .unwrap_or_default();
-                Ok((blocks, head))
-            }
-            Err(error) => Err(glommio_io_error(error)),
-        }
+            .context("failed to parse block header")?;
+
+        let head = blocks
+            .iter()
+            .enumerate()
+            .filter(|(_index, block)| block.exists && !block.dead)
+            .max_by_key(|(_index, block)| block.slot)
+            .map(|(index, _block)| index)
+            .unwrap_or_default();
+        Ok((blocks, head))
+    }
+
+    pub async fn close(self) {
+        let _: io::Result<()> = self.file.close().await;
     }
 
     pub fn get_stored_boundaries(&self) -> HashMap<StorageId, StorageBlockBoundaries> {
@@ -152,27 +105,19 @@ impl StoredBlockHeaders {
         block.exists.then_some(block.slot)
     }
 
-    async fn sync(&self, index: usize) -> Result<(), GlommioError<()>> {
-        let mut buffer = self.file.alloc_dma_buffer(self.file.alignment() as usize);
+    async fn sync(&self, index: usize) -> io::Result<()> {
+        let mut buffer = vec![0; StoredBlockHeader::BYTES_SIZE];
+        self.blocks[index]
+            .copy_to_slice(&mut buffer)
+            .expect("valid slice len");
 
-        let from_index = align_down_usize(index, self.blocks_alignment);
-        for (mut offset, index) in (from_index..(from_index + self.blocks_alignment)).enumerate() {
-            offset *= StoredBlockHeader::BYTES_SIZE;
-            let bytes = &mut buffer.as_bytes_mut()[offset..offset + StoredBlockHeader::BYTES_SIZE];
-            self.blocks[index]
-                .copy_to_slice(bytes)
-                .expect("valid slice len");
-        }
-
-        let res = self
+        let (result, _buffer) = self
             .file
-            .write_at(buffer, (from_index * StoredBlockHeader::BYTES_SIZE) as u64)
-            .await?;
-        if res == self.file.alignment() as usize {
-            Ok(())
-        } else {
-            Err(glommio_io_error("invalid write size"))
-        }
+            .write_all_at(buffer, (index * StoredBlockHeader::BYTES_SIZE) as u64)
+            .await;
+        let () = result?;
+
+        Ok(())
     }
 
     async fn push_block(&mut self, block: StoredBlockHeader) -> anyhow::Result<()> {
@@ -194,16 +139,13 @@ impl StoredBlockHeaders {
     pub async fn push_block_confirmed(
         &mut self,
         slot: Slot,
-        block: &ConfirmedBlockWithBinary,
+        block_time: Option<UnixTimestamp>,
         storage_id: StorageId,
         offset: u64,
+        block_size: u64,
     ) -> anyhow::Result<()> {
         self.push_block(StoredBlockHeader::new_confirmed(
-            slot,
-            block.block_time,
-            storage_id,
-            offset,
-            block.get_blob().len() as u64,
+            slot, block_time, storage_id, offset, block_size,
         ))
         .await
     }

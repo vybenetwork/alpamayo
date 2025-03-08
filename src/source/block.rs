@@ -16,7 +16,7 @@ pub enum SerializeBlockError {
 #[derive(Debug)]
 pub struct ConfirmedBlockWithBinary {
     block: ConfirmedBlock,
-    blob: Vec<u8>,
+    buffer: Vec<u8>,
 }
 
 impl AsRef<ConfirmedBlock> for ConfirmedBlockWithBinary {
@@ -35,8 +35,8 @@ impl Deref for ConfirmedBlockWithBinary {
 
 impl ConfirmedBlockWithBinary {
     pub fn new(block: ConfirmedBlock) -> Result<Self, SerializeBlockError> {
-        let blob = Self::serialize(&block)?;
-        Ok(Self { block, blob })
+        let buffer = Self::serialize(&block)?;
+        Ok(Self { block, buffer })
     }
 
     fn serialize(block: &ConfirmedBlock) -> Result<Vec<u8>, SerializeBlockError> {
@@ -68,7 +68,7 @@ impl ConfirmedBlockWithBinary {
         Ok(block.encode_to_vec())
     }
 
-    pub fn get_blob(&self) -> &[u8] {
-        &self.blob
+    pub fn take_buffer(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buffer)
     }
 }
