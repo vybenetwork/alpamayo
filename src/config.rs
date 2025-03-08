@@ -1,4 +1,5 @@
 use {
+    crate::storage::files::StorageId,
     human_size::Size,
     richat_client::grpc::ConfigGrpcClient,
     richat_shared::config::{ConfigTokio, deserialize_num_str},
@@ -177,19 +178,19 @@ impl ConfigStorageBlocks {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigStorageFile {
-    pub id: u32,
+    pub id: StorageId,
     pub path: PathBuf,
     #[serde(deserialize_with = "deserialize_humansize")]
-    pub size: usize,
+    pub size: u64,
 }
 
-fn deserialize_humansize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+fn deserialize_humansize<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
 {
     let size: &str = Deserialize::deserialize(deserializer)?;
 
     Size::from_str(size)
-        .map(|size| size.to_bytes() as usize)
+        .map(|size| size.to_bytes())
         .map_err(|error| de::Error::custom(format!("failed to parse size {size:?}: {error}")))
 }

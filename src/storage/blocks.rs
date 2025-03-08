@@ -1,22 +1,29 @@
 use {
-    crate::config::ConfigStorageBlocks,
+    crate::{
+        config::ConfigStorageBlocks,
+        source::block::ConfirmedBlockWithBinary,
+        storage::{error::glommio_io_error, files::StorageId},
+    },
     bitflags::bitflags,
     glommio::{
         GlommioError,
         io::{DmaFile, OpenOptions},
     },
-    solana_sdk::clock::Slot,
-    solana_transaction_status::ConfirmedBlock,
-    std::io,
+    solana_sdk::clock::{Slot, UnixTimestamp},
+    std::collections::HashMap,
     thiserror::Error,
 };
+
+fn align_down_usize(v: usize, align: usize) -> usize {
+    v & !(align - 1)
+}
 
 #[derive(Debug)]
 pub struct StoredBlockHeaders {
     file: DmaFile,
+    blocks_alignment: usize,
     blocks: Vec<StoredBlockHeader>,
     head: usize,
-    blocks_per_write: usize,
 }
 
 impl StoredBlockHeaders {
@@ -35,7 +42,7 @@ impl StoredBlockHeaders {
             "alignment {} is not supported",
             file.alignment()
         );
-        let blocks_per_write = file.alignment() as usize / StoredBlockHeader::BYTES_SIZE;
+        let blocks_alignment = file.alignment() as usize / StoredBlockHeader::BYTES_SIZE;
 
         // verify file size
         let file_size_current = file.file_size().await.map_err(|error| {
@@ -70,9 +77,9 @@ impl StoredBlockHeaders {
 
         Ok(Self {
             file,
+            blocks_alignment,
             blocks,
             head,
-            blocks_per_write,
         })
     }
 
@@ -81,23 +88,20 @@ impl StoredBlockHeaders {
         file_size: usize,
     ) -> Result<Vec<StoredBlockHeader>, GlommioError<()>> {
         let max = file_size / StoredBlockHeader::BYTES_SIZE;
-        let mut buf = file.alloc_dma_buffer(file_size);
+        let mut buffer = file.alloc_dma_buffer(file_size);
 
         let blocks = vec![StoredBlockHeader::default(); max];
         for (index, block) in blocks.iter().enumerate() {
             let offset = index * StoredBlockHeader::BYTES_SIZE;
-            let bytes = &mut buf.as_bytes_mut()[offset..offset + StoredBlockHeader::BYTES_SIZE];
+            let bytes = &mut buffer.as_bytes_mut()[offset..offset + StoredBlockHeader::BYTES_SIZE];
             block.copy_to_slice(bytes).expect("valid slice len");
         }
 
-        let res = file.write_at(buf, 0).await?;
+        let res = file.write_at(buffer, 0).await?;
         if res == file_size {
             Ok(blocks)
         } else {
-            Err(GlommioError::IoError(io::Error::new(
-                io::ErrorKind::Other,
-                "invalid write size",
-            )))
+            Err(glommio_io_error("invalid write size"))
         }
     }
 
@@ -124,11 +128,23 @@ impl StoredBlockHeaders {
                     .unwrap_or_default();
                 Ok((blocks, head))
             }
-            Err(error) => Err(GlommioError::IoError(io::Error::new(
-                io::ErrorKind::Other,
-                error,
-            ))),
+            Err(error) => Err(glommio_io_error(error)),
         }
+    }
+
+    pub fn get_stored_boundaries(&self) -> HashMap<StorageId, StorageBlockBoundaries> {
+        let mut map = HashMap::<StorageId, StorageBlockBoundaries>::new();
+        for block in self.blocks.iter() {
+            if block.exists && !block.dead {
+                map.entry(block.storage_id).or_default().update(block);
+            }
+        }
+        map
+    }
+
+    pub fn is_full(&self) -> bool {
+        let next = (self.head + 1) % self.blocks.len();
+        self.blocks[next].exists
     }
 
     pub fn get_latest_slot(&self) -> Option<Slot> {
@@ -136,9 +152,60 @@ impl StoredBlockHeaders {
         block.exists.then_some(block.slot)
     }
 
-    pub fn push_block(&self, slot: Slot, block: Option<ConfirmedBlock>) {
-        tracing::info!("new block #{slot} block {:?}", block.is_some());
-        // TODO
+    async fn sync(&self, index: usize) -> Result<(), GlommioError<()>> {
+        let mut buffer = self.file.alloc_dma_buffer(self.file.alignment() as usize);
+
+        let from_index = align_down_usize(index, self.blocks_alignment);
+        for (mut offset, index) in (from_index..(from_index + self.blocks_alignment)).enumerate() {
+            offset *= StoredBlockHeader::BYTES_SIZE;
+            let bytes = &mut buffer.as_bytes_mut()[offset..offset + StoredBlockHeader::BYTES_SIZE];
+            self.blocks[index]
+                .copy_to_slice(bytes)
+                .expect("valid slice len");
+        }
+
+        let res = self
+            .file
+            .write_at(buffer, (from_index * StoredBlockHeader::BYTES_SIZE) as u64)
+            .await?;
+        if res == self.file.alignment() as usize {
+            Ok(())
+        } else {
+            Err(glommio_io_error("invalid write size"))
+        }
+    }
+
+    async fn push_block(&mut self, block: StoredBlockHeader) -> anyhow::Result<()> {
+        self.head = (self.head + 1) % self.blocks.len();
+        anyhow::ensure!(
+            !self.blocks[self.head].exists,
+            "blocks should have free slot"
+        );
+        self.blocks[self.head] = block;
+        self.sync(self.head)
+            .await
+            .map_err(|error| anyhow::anyhow!("failed to sync block headers: {error:?}"))
+    }
+
+    pub async fn push_block_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
+        self.push_block(StoredBlockHeader::new_dead(slot)).await
+    }
+
+    pub async fn push_block_confirmed(
+        &mut self,
+        slot: Slot,
+        block: &ConfirmedBlockWithBinary,
+        storage_id: StorageId,
+        offset: u64,
+    ) -> anyhow::Result<()> {
+        self.push_block(StoredBlockHeader::new_confirmed(
+            slot,
+            block.block_time,
+            storage_id,
+            offset,
+            block.get_blob().len() as u64,
+        ))
+        .await
     }
 }
 
@@ -147,8 +214,8 @@ struct StoredBlockHeader {
     exists: bool,
     dead: bool,
     slot: Slot,
-    block_time: Option<i64>,
-    storage_id: u32,
+    block_time: Option<UnixTimestamp>,
+    storage_id: StorageId,
     offset: u64,
     size: u64,
 }
@@ -162,6 +229,33 @@ impl StoredBlockHeader {
     // size: u64
     // total: 40 bytes
     const BYTES_SIZE: usize = 64;
+
+    fn new_dead(slot: Slot) -> Self {
+        Self {
+            exists: true,
+            dead: true,
+            slot,
+            ..Default::default()
+        }
+    }
+
+    fn new_confirmed(
+        slot: Slot,
+        block_time: Option<UnixTimestamp>,
+        storage_id: StorageId,
+        offset: u64,
+        size: u64,
+    ) -> Self {
+        Self {
+            exists: true,
+            dead: false,
+            slot,
+            block_time,
+            storage_id,
+            offset,
+            size,
+        }
+    }
 
     fn from_bytes(bytes: &[u8]) -> Result<Self, StoredBlockHeaderParseError> {
         if bytes.len() != Self::BYTES_SIZE {
@@ -179,8 +273,8 @@ impl StoredBlockHeader {
             slot: u64::from_be_bytes(bytes[8..16].try_into()?),
             block_time: flags
                 .contains(StoredBlockHeaderFlags::BLOCK_TIME)
-                .then_some(i64::from_be_bytes(bytes[16..24].try_into()?)),
-            storage_id: u32::from_be_bytes(bytes[4..8].try_into()?),
+                .then_some(UnixTimestamp::from_be_bytes(bytes[16..24].try_into()?)),
+            storage_id: StorageId::from_be_bytes(bytes[4..8].try_into()?),
             offset: u64::from_be_bytes(bytes[24..32].try_into()?),
             size: u64::from_be_bytes(bytes[32..40].try_into()?),
         })
@@ -246,5 +340,39 @@ bitflags! {
         const EXISTS =     0b00000001;
         const DEAD =       0b00000010;
         const BLOCK_TIME = 0b00000100;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StorageBlockBoundaries {
+    min: Option<StoredBlockHeader>,
+    max: Option<StoredBlockHeader>,
+}
+
+impl StorageBlockBoundaries {
+    fn update(&mut self, block: &StoredBlockHeader) {
+        if let Some(min) = &mut self.min {
+            if block.slot < min.slot {
+                *min = *block;
+            }
+        } else {
+            self.min = Some(*block);
+        }
+
+        if let Some(max) = &mut self.max {
+            if block.slot > max.slot {
+                *max = *block;
+            }
+        } else {
+            self.max = Some(*block);
+        }
+    }
+
+    pub fn tail(&self) -> Option<u64> {
+        self.min.map(|block| block.offset)
+    }
+
+    pub fn head(&self) -> Option<u64> {
+        self.max.map(|block| block.offset + block.size)
     }
 }

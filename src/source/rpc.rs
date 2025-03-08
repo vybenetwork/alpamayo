@@ -1,5 +1,8 @@
 use {
-    crate::config::ConfigSourceRpc,
+    crate::{
+        config::ConfigSourceRpc,
+        source::block::{ConfirmedBlockWithBinary, SerializeBlockError},
+    },
     base64::{Engine, prelude::BASE64_STANDARD},
     solana_client::{
         client_error::{ClientError, ClientErrorKind},
@@ -50,6 +53,8 @@ pub enum GetBlockError {
     BlockNotAvailable(Slot),
     #[error(transparent)]
     Decode(#[from] BlockDecodeError),
+    #[error(transparent)]
+    Serialize(#[from] SerializeBlockError),
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +111,7 @@ impl RpcSource {
             .await
     }
 
-    pub async fn get_block(&self, slot: Slot) -> Result<ConfirmedBlock, GetBlockError> {
+    pub async fn get_block(&self, slot: Slot) -> Result<ConfirmedBlockWithBinary, GetBlockError> {
         let config = RpcBlockConfig {
             encoding: Some(UiTransactionEncoding::Base64),
             transaction_details: Some(TransactionDetails::Full),
@@ -148,7 +153,8 @@ impl RpcSource {
             }
         };
 
-        Self::block_decode(block).map_err(Into::into)
+        let block = Self::block_decode(block)?;
+        ConfirmedBlockWithBinary::new(block).map_err(Into::into)
     }
 
     fn block_decode(block: UiConfirmedBlock) -> Result<ConfirmedBlock, BlockDecodeError> {

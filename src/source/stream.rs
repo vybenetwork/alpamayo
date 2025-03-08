@@ -1,5 +1,8 @@
 use {
-    crate::config::{ConfigSourceStream, ConfigSourceStreamKind},
+    crate::{
+        config::{ConfigSourceStream, ConfigSourceStreamKind},
+        source::block::{ConfirmedBlockWithBinary, SerializeBlockError},
+    },
     futures::{StreamExt, ready, stream::Stream},
     maplit::hashmap,
     richat_client::{grpc::GrpcClientBuilderError, stream::SubscribeStream},
@@ -50,6 +53,8 @@ pub enum RecvError {
     TransactionWithMetaFailed(&'static str),
     #[error("failed to build reward: {0}")]
     RewardsFailed(&'static str),
+    #[error(transparent)]
+    SerializeBlockError(#[from] SerializeBlockError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +68,7 @@ pub enum StreamSourceSlotStatus {
 pub enum StreamSourceMessage {
     Block {
         slot: Slot,
-        block: ConfirmedBlock,
+        block: ConfirmedBlockWithBinary,
     },
     SlotStatus {
         slot: Slot,
@@ -114,7 +119,7 @@ impl SlotInfo {
         }
     }
 
-    fn try_build_block(&mut self) -> Option<Result<ConfirmedBlock, RecvError>> {
+    fn try_build_block(&mut self) -> Option<Result<ConfirmedBlockWithBinary, RecvError>> {
         if self.sealed
             || self
                 .block_meta
@@ -145,7 +150,7 @@ impl SlotInfo {
             None => (vec![], None),
         };
 
-        Some(Ok(ConfirmedBlock {
+        let block = ConfirmedBlock {
             previous_blockhash: block_meta.parent_blockhash,
             blockhash: block_meta.blockhash,
             parent_slot: block_meta.parent_slot,
@@ -154,7 +159,9 @@ impl SlotInfo {
             num_partitions,
             block_time: block_meta.block_time.map(|obj| obj.timestamp),
             block_height: block_meta.block_height.map(|obj| obj.block_height),
-        }))
+        };
+
+        Some(ConfirmedBlockWithBinary::new(block).map_err(Into::into))
     }
 }
 

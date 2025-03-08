@@ -2,11 +2,13 @@ use {
     crate::{
         config::ConfigStorage,
         source::{
+            block::ConfirmedBlockWithBinary,
             rpc::GetBlockError,
             stream::{StreamSourceMessage, StreamSourceSlotStatus},
         },
         storage::{
             blocks::StoredBlockHeaders,
+            files::Files,
             memory::{MemoryConfirmedBlock, MemoryStorage},
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
@@ -18,7 +20,6 @@ use {
     glommio::{LocalExecutorBuilder, Placement, Task, spawn_local, timer::sleep},
     richat_shared::shutdown::Shutdown,
     solana_sdk::clock::Slot,
-    solana_transaction_status::ConfirmedBlock,
     std::{
         collections::HashMap,
         thread::{Builder, JoinHandle},
@@ -61,7 +62,8 @@ async fn start2(
     let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
     let rpc = RpcSourceConnected::new(rpc_tx);
 
-    let blocks = StoredBlockHeaders::open(config.blocks).await?;
+    let mut blocks = StoredBlockHeaders::open(config.blocks).await?;
+    let mut files = Files::open(config.files, &blocks).await?;
     let mut memory_storage = MemoryStorage::default();
 
     // fill the gap between stored and new
@@ -73,7 +75,9 @@ async fn start2(
     let mut requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
     let get_confirmed_block = |requests: &mut FuturesUnordered<
-        Task<Result<(u64, Option<ConfirmedBlock>), RpcSourceConnectedError<GetBlockError>>>,
+        Task<
+            Result<(u64, Option<ConfirmedBlockWithBinary>), RpcSourceConnectedError<GetBlockError>>,
+        >,
     >,
                                slot: Slot| {
         let mut max_retries = rpc_getblock_max_retries;
@@ -103,7 +107,7 @@ async fn start2(
         }));
     };
 
-    let mut queued_slots = HashMap::<Slot, Option<ConfirmedBlock>>::new();
+    let mut queued_slots = HashMap::<Slot, Option<ConfirmedBlockWithBinary>>::new();
     let mut queued_slots_backfilled = false;
 
     tokio::pin!(shutdown);
@@ -183,7 +187,9 @@ async fn start2(
 
         // save blocks
         while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
-            blocks.push_block(next_confirmed_slot, block);
+            files
+                .push_block(next_confirmed_slot, block.as_ref(), &mut blocks)
+                .await?;
             next_confirmed_slot += 1;
         }
     }

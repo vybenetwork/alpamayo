@@ -2,6 +2,7 @@ use {
     crate::{
         config::ConfigSource,
         source::{
+            block::ConfirmedBlockWithBinary,
             rpc::{GetBlockError, RpcSource},
             stream::{StreamSource, StreamSourceMessage},
         },
@@ -10,7 +11,6 @@ use {
     richat_shared::shutdown::Shutdown,
     solana_client::client_error::ClientError,
     solana_sdk::clock::Slot,
-    solana_transaction_status::ConfirmedBlock,
     std::sync::Arc,
     thiserror::Error,
     tokio::sync::{mpsc, oneshot},
@@ -24,7 +24,7 @@ pub enum RpcRequest {
     },
     Block {
         slot: Slot,
-        tx: oneshot::Sender<Result<ConfirmedBlock, GetBlockError>>,
+        tx: oneshot::Sender<Result<ConfirmedBlockWithBinary, GetBlockError>>,
     },
 }
 
@@ -74,7 +74,7 @@ impl RpcSourceConnected {
     pub async fn get_block(
         &self,
         slot: Slot,
-    ) -> RpcSourceConnectedResult<ConfirmedBlock, GetBlockError> {
+    ) -> RpcSourceConnectedResult<ConfirmedBlockWithBinary, GetBlockError> {
         let (tx, rx) = oneshot::channel();
         self.send(RpcRequest::Block { slot, tx }, rx).await
     }
