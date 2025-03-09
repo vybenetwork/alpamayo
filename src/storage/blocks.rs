@@ -15,7 +15,8 @@ use {
 pub struct StoredBlockHeaders {
     file: File,
     blocks: Vec<StoredBlockHeader>,
-    head: usize,
+    tail: usize, // lowest slot
+    head: usize, // highest slot
 }
 
 impl StoredBlockHeaders {
@@ -24,11 +25,12 @@ impl StoredBlockHeaders {
 
         // init, truncate, load, allocate
         let file_size_expected = (config.max * StoredBlockHeader::BYTES_SIZE) as u64;
-        let (blocks, head) = if file_size_current == 0 {
+        let (blocks, tail, head) = if file_size_current == 0 {
             let blocks = Self::open_init(&file, config.max)
                 .await
                 .with_context(|| format!("failed to init file {:?}", config.path))?;
-            (blocks, 0)
+            let head = blocks.len() - 1;
+            (blocks, 0, head)
         } else if file_size_current < file_size_expected {
             unimplemented!("truncate");
         } else if file_size_current == file_size_expected {
@@ -39,12 +41,17 @@ impl StoredBlockHeaders {
             unimplemented!("allocate");
         };
 
-        Ok(Self { file, blocks, head })
+        Ok(Self {
+            file,
+            blocks,
+            tail,
+            head,
+        })
     }
 
     async fn open_init(file: &File, max: usize) -> io::Result<Vec<StoredBlockHeader>> {
         let mut buffer = vec![0; max * StoredBlockHeader::BYTES_SIZE];
-        let blocks = vec![StoredBlockHeader::default(); max];
+        let blocks = vec![StoredBlockHeader::new_noexists(); max];
         for (index, block) in blocks.iter().enumerate() {
             let offset = index * StoredBlockHeader::BYTES_SIZE;
             let bytes = &mut buffer[offset..offset + StoredBlockHeader::BYTES_SIZE];
@@ -57,7 +64,10 @@ impl StoredBlockHeaders {
         Ok(blocks)
     }
 
-    async fn open_load(file: &File, max: usize) -> anyhow::Result<(Vec<StoredBlockHeader>, usize)> {
+    async fn open_load(
+        file: &File,
+        max: usize,
+    ) -> anyhow::Result<(Vec<StoredBlockHeader>, usize, usize)> {
         let buffer = Vec::with_capacity(max * StoredBlockHeader::BYTES_SIZE);
         let (result, buffer) = file.read_exact_at(buffer, 0).await;
         let () = result?;
@@ -71,22 +81,31 @@ impl StoredBlockHeaders {
             .collect::<Result<Vec<_>, _>>()
             .context("failed to parse block header")?;
 
-        let head = blocks
+        let iter = blocks
             .iter()
             .enumerate()
-            .filter(|(_index, block)| block.exists && !block.dead)
+            .filter(|(_index, block)| block.exists && !block.dead);
+
+        let tail = iter
+            .clone()
+            .min_by_key(|(_index, block)| block.slot)
+            .map(|(index, _block)| index)
+            .unwrap_or_default();
+
+        let head = iter
             .max_by_key(|(_index, block)| block.slot)
             .map(|(index, _block)| index)
             .unwrap_or_default();
-        Ok((blocks, head))
+
+        Ok((blocks, tail, head))
     }
 
     pub async fn close(self) {
         let _: io::Result<()> = self.file.close().await;
     }
 
-    pub fn get_stored_boundaries(&self) -> HashMap<StorageId, StorageBlockBoundaries> {
-        let mut map = HashMap::<StorageId, StorageBlockBoundaries>::new();
+    pub fn get_stored_boundaries(&self) -> HashMap<StorageId, StorageBlockHeadersBoundaries> {
+        let mut map = HashMap::<StorageId, StorageBlockHeadersBoundaries>::new();
         for block in self.blocks.iter() {
             if block.exists && !block.dead {
                 map.entry(block.storage_id).or_default().update(block);
@@ -122,10 +141,7 @@ impl StoredBlockHeaders {
 
     async fn push_block(&mut self, block: StoredBlockHeader) -> anyhow::Result<()> {
         self.head = (self.head + 1) % self.blocks.len();
-        anyhow::ensure!(
-            !self.blocks[self.head].exists,
-            "blocks should have free slot"
-        );
+        anyhow::ensure!(!self.blocks[self.head].exists, "no free slot");
         self.blocks[self.head] = block;
         self.sync(self.head)
             .await
@@ -149,6 +165,22 @@ impl StoredBlockHeaders {
         ))
         .await
     }
+
+    pub async fn pop_block(&mut self) -> io::Result<Option<StorageBlockHeaderLocation>> {
+        if !self.blocks[self.tail].exists {
+            return Ok(None);
+        }
+
+        let block = std::mem::replace(
+            &mut self.blocks[self.tail],
+            StoredBlockHeader::new_noexists(),
+        );
+        self.sync(self.tail).await?;
+
+        self.tail = (self.tail + 1) % self.blocks.len();
+
+        Ok(Some(block.into()))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -171,6 +203,10 @@ impl StoredBlockHeader {
     // size: u64
     // total: 40 bytes
     const BYTES_SIZE: usize = 64;
+
+    fn new_noexists() -> Self {
+        Self::default()
+    }
 
     fn new_dead(slot: Slot) -> Self {
         Self {
@@ -286,12 +322,12 @@ bitflags! {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub struct StorageBlockBoundaries {
+pub struct StorageBlockHeadersBoundaries {
     min: Option<StoredBlockHeader>,
     max: Option<StoredBlockHeader>,
 }
 
-impl StorageBlockBoundaries {
+impl StorageBlockHeadersBoundaries {
     fn update(&mut self, block: &StoredBlockHeader) {
         if let Some(min) = &mut self.min {
             if block.slot < min.slot {
@@ -316,5 +352,24 @@ impl StorageBlockBoundaries {
 
     pub fn head(&self) -> Option<u64> {
         self.max.map(|block| block.offset + block.size)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StorageBlockHeaderLocation {
+    pub slot: Slot,
+    pub storage_id: StorageId,
+    pub offset: u64,
+    pub size: u64,
+}
+
+impl From<StoredBlockHeader> for StorageBlockHeaderLocation {
+    fn from(block: StoredBlockHeader) -> Self {
+        Self {
+            slot: block.slot,
+            storage_id: block.storage_id,
+            offset: block.offset,
+            size: block.size,
+        }
     }
 }

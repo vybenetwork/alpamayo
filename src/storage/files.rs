@@ -59,11 +59,9 @@ impl StorageFiles {
 
         // verify file size
         if file_size == 0 {
-            let ts = std::time::SystemTime::now();
             file.fallocate(0, config.size, libc::FALLOC_FL_ZERO_RANGE)
                 .await
                 .with_context(|| format!("failed to preallocate {:?}", config.path))?;
-            tracing::error!("fallocate, elapsed: {:?}", ts.elapsed().unwrap());
         } else if config.size != file_size {
             anyhow::bail!(
                 "invalid file size {:?}: {file_size} (expected: {})",
@@ -96,7 +94,7 @@ impl StorageFiles {
         blocks: &mut StoredBlockHeaders,
     ) -> anyhow::Result<()> {
         if blocks.is_full() {
-            todo!() // remove block
+            self.pop_block(blocks).await?;
         }
 
         let Some(mut block) = block else {
@@ -108,9 +106,7 @@ impl StorageFiles {
         let file_index = loop {
             match self.get_file_index_for_new_block(buffer_size) {
                 Some(index) => break index,
-                None => {
-                    todo!() // remove block
-                }
+                None => self.pop_block(blocks).await?,
             }
         };
 
@@ -124,6 +120,22 @@ impl StorageFiles {
         blocks
             .push_block_confirmed(slot, block.block_time, file.id, offset, buffer_size)
             .await
+    }
+
+    async fn pop_block(&mut self, blocks: &mut StoredBlockHeaders) -> anyhow::Result<()> {
+        let Some(block) = blocks.pop_block().await? else {
+            anyhow::bail!("no blocks to remove");
+        };
+
+        let Some(file_index) = self.id2file.get(&block.storage_id).copied() else {
+            anyhow::bail!("unknown storage id: {}", block.storage_id);
+        };
+        let file = &mut self.files[file_index];
+
+        anyhow::ensure!(file.tail == block.offset, "tail / block.offset mismatch");
+        file.tail = (file.tail + block.size) % file.size;
+
+        Ok(())
     }
 
     fn get_file_index_for_new_block(&mut self, size: u64) -> Option<usize> {
@@ -167,6 +179,9 @@ impl StorageFile {
 
         let (result, buffer) = self.file.write_all_at(buffer, self.head).await;
         let () = result?;
+
+        self.head = (self.head + buffer.len() as u64) % self.size;
+
         Ok(buffer)
     }
 }
