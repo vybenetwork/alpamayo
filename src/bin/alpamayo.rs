@@ -6,10 +6,11 @@ use {
     richat_shared::shutdown::Shutdown,
     signal_hook::{consts::SIGINT, iterator::Signals},
     std::{
+        sync::Arc,
         thread::{self, sleep},
         time::Duration,
     },
-    tokio::sync::mpsc,
+    tokio::sync::{Notify, mpsc},
     tracing::{info, warn},
 };
 
@@ -47,11 +48,13 @@ fn main() -> anyhow::Result<()> {
     let shutdown = Shutdown::new();
 
     // Create source / storage channels
+    let stream_start = Arc::new(Notify::new());
     let (stream_tx, stream_rx) = mpsc::channel(2_048);
     let (rpc_tx, rpc_rx) = mpsc::channel(2_048);
 
     // Create global runtime
     let app_rt_jh = thread::Builder::new().name("appTokio".to_owned()).spawn({
+        let stream_start = Arc::clone(&stream_start);
         let shutdown = shutdown.clone();
         move || {
             let runtime = config.tokio.build_runtime("appTokioRt")?;
@@ -59,6 +62,7 @@ fn main() -> anyhow::Result<()> {
                 let source_fut = tokio::spawn(storage::source::start(
                     config.source,
                     rpc_rx,
+                    stream_start,
                     stream_tx,
                     shutdown.clone(),
                 ))
@@ -83,8 +87,13 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     // Storage runtimes
-    let storage_write_jh =
-        storage::write::start(config.storage, rpc_tx, stream_rx, shutdown.clone())?;
+    let storage_write_jh = storage::write::start(
+        config.storage,
+        rpc_tx,
+        stream_start,
+        stream_rx,
+        shutdown.clone(),
+    )?;
 
     // Shutdown loop
     let mut signals = Signals::new([SIGINT])?;

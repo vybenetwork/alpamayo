@@ -4,7 +4,7 @@ use {
         source::{
             block::ConfirmedBlockWithBinary,
             rpc::{GetBlockError, RpcSource},
-            stream::{StreamSource, StreamSourceMessage},
+            stream::{RecvError, StreamSource, StreamSourceMessage},
         },
     },
     futures::stream::StreamExt,
@@ -13,7 +13,7 @@ use {
     solana_sdk::clock::Slot,
     std::sync::Arc,
     thiserror::Error,
-    tokio::sync::{mpsc, oneshot},
+    tokio::sync::{Notify, mpsc, oneshot},
     tracing::error,
 };
 
@@ -83,56 +83,83 @@ impl RpcSourceConnected {
 pub async fn start(
     config: ConfigSource,
     mut rpc_rx: mpsc::Receiver<RpcRequest>,
+    stream_start: Arc<Notify>,
     stream_tx: mpsc::Sender<StreamSourceMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     let rpc = Arc::new(RpcSource::new(config.rpc).await?);
-    let mut stream = StreamSource::new(config.stream).await?;
+    let mut stream: Option<StreamSource> = None;
 
     tokio::pin!(shutdown);
-    loop {
-        tokio::select! {
-            () = &mut shutdown => return Ok(()),
-            item = rpc_rx.recv() => match item {
-                Some(request) => {
-                    let rpc = Arc::clone(&rpc);
-                    tokio::spawn(async move {
-                        match request {
-                            RpcRequest::ConfirmedSlot { tx } => {
-                                let result = rpc.get_confirmed_slot().await;
-                                let _ = tx.send(result);
-                            }
-                            RpcRequest::Block { slot, tx } => {
-                                let result = rpc.get_block(slot).await;
-                                let _ = tx.send(result);
-                            }
-                        }
-                    });
-                },
-                None => {
-                    error!("RPC requests stream is finished");
-                    break;
-                }
-            },
-            item = stream.next() => match item {
-                Some(Ok(message)) => {
-                    if stream_tx.send(message).await.is_err() {
-                        error!("failed to send a message to the stream");
-                        break;
-                    }
-                },
-                Some(Err(error)) => {
-                    error!(?error, "gRPC stream error");
-                    break;
-                },
-                None => {
-                    error!("gRPC stream is finished");
-                    break
+    let mut finished = false;
+    while !finished {
+        finished = if let Some(stream) = stream.as_mut() {
+            tokio::select! {
+                () = &mut shutdown => true,
+                item = rpc_rx.recv() => handle_rpc(item, &rpc),
+                item = stream.next() => handle_stream(item, &stream_tx).await
+            }
+        } else {
+            tokio::select! {
+                () = &mut shutdown => true,
+                item = rpc_rx.recv() => handle_rpc(item, &rpc),
+                () = stream_start.notified() => {
+                    stream = Some(StreamSource::new(config.stream.clone()).await?);
+                    false
                 },
             }
-        }
+        };
     }
     shutdown.shutdown();
 
     Ok(())
+}
+
+fn handle_rpc(item: Option<RpcRequest>, rpc: &Arc<RpcSource>) -> bool {
+    match item {
+        Some(request) => {
+            let rpc = Arc::clone(rpc);
+            tokio::spawn(async move {
+                match request {
+                    RpcRequest::ConfirmedSlot { tx } => {
+                        let result = rpc.get_confirmed_slot().await;
+                        let _ = tx.send(result);
+                    }
+                    RpcRequest::Block { slot, tx } => {
+                        let result = rpc.get_block(slot).await;
+                        let _ = tx.send(result);
+                    }
+                }
+            });
+            false
+        }
+        None => {
+            error!("RPC requests stream is finished");
+            true
+        }
+    }
+}
+
+async fn handle_stream(
+    item: Option<Result<StreamSourceMessage, RecvError>>,
+    stream_tx: &mpsc::Sender<StreamSourceMessage>,
+) -> bool {
+    match item {
+        Some(Ok(message)) => {
+            if stream_tx.send(message).await.is_err() {
+                error!("failed to send a message to the stream");
+                true
+            } else {
+                false
+            }
+        }
+        Some(Err(error)) => {
+            error!(?error, "gRPC stream error");
+            true
+        }
+        None => {
+            error!("gRPC stream is finished");
+            true
+        }
+    }
 }

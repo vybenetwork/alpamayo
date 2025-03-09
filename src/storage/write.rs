@@ -13,15 +13,21 @@ use {
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
     },
+    anyhow::Context,
     futures::{
         future::{FutureExt, pending},
         stream::{FuturesUnordered, StreamExt},
     },
     richat_shared::shutdown::Shutdown,
     solana_sdk::clock::Slot,
-    std::{collections::HashMap, thread, time::Duration},
+    std::{
+        collections::HashMap,
+        sync::Arc,
+        thread,
+        time::{Duration, Instant},
+    },
     tokio::{
-        sync::mpsc,
+        sync::{Notify, mpsc},
         task::{JoinHandle, spawn_local},
         time::sleep,
     },
@@ -31,6 +37,7 @@ use {
 pub fn start(
     config: ConfigStorage,
     rpc_tx: mpsc::Sender<RpcRequest>,
+    stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
@@ -52,6 +59,7 @@ pub fn start(
                     rpc_getblock_backoff_init,
                     rpc_getblock_max_concurrency,
                     rpc,
+                    stream_start,
                     stream_rx,
                     &mut blocks,
                     &mut files,
@@ -75,18 +83,14 @@ async fn start2(
     rpc_getblock_backoff_init: Duration,
     rpc_getblock_max_concurrency: usize,
     rpc: RpcSourceConnected,
+    stream_start: Arc<Notify>,
     mut stream_rx: mpsc::Receiver<StreamSourceMessage>,
     blocks: &mut StoredBlockHeaders,
     files: &mut StorageFiles,
     mut memory_storage: MemoryStorage,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    // fill the gap between stored and new
-    let mut next_confirmed_slot = rpc.get_slot_confirmed().await?;
-    if let Some(_slot) = blocks.get_latest_slot() {
-        todo!()
-    }
-
+    // get block requests
     let mut requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
     let get_confirmed_block = |requests: &mut FuturesUnordered<
@@ -122,11 +126,66 @@ async fn start2(
         }));
     };
 
+    // queue of confirmed blocks
     let mut queued_slots = HashMap::<Slot, Option<ConfirmedBlockWithBinary>>::new();
     let mut queued_slots_backfilled = false;
 
+    // fill the gap between stored and new
+    let mut next_confirmed_slot = rpc.get_slot_confirmed().await?;
+    if let Some(slot) = blocks.get_latest_slot() {
+        tracing::info!(slot, next_confirmed_slot, "latest");
+
+        let mut next_confirmed_slot_last_update = Instant::now();
+        let mut next_request_slot = slot + 1;
+        let mut next_database_slot = slot + 1;
+        let mut requests_in_flight = 0;
+
+        loop {
+            // update confirmed slot every 3s
+            if next_confirmed_slot_last_update.elapsed() > Duration::from_secs(3) {
+                next_confirmed_slot = rpc.get_slot_confirmed().await?;
+                next_confirmed_slot_last_update = Instant::now();
+            }
+
+            // break if we are close enough
+            if next_database_slot + 2 >= next_confirmed_slot {
+                break;
+            }
+
+            // get blocks
+            while next_request_slot <= next_confirmed_slot
+                && requests_in_flight < rpc_getblock_max_concurrency
+            {
+                get_confirmed_block(&mut requests, next_request_slot);
+                next_request_slot += 1;
+                requests_in_flight += 1;
+            }
+
+            // push block into the queue
+            match requests.next().await {
+                Some(Ok(Ok((slot, block)))) => {
+                    requests_in_flight -= 1;
+                    queued_slots.insert(slot, block);
+                }
+                Some(Ok(Err(error))) => {
+                    return Err(error).context("failed to get confirmed block");
+                }
+                Some(Err(error)) => {
+                    return Err(error).context("failed to join spawned task");
+                }
+                None => unreachable!(),
+            }
+
+            while let Some(block) = queued_slots.remove(&next_database_slot) {
+                files.push_block(next_database_slot, block, blocks).await?;
+                next_database_slot += 1;
+            }
+        }
+    }
+    stream_start.notify_one();
+
     tokio::pin!(shutdown);
-    'outer: loop {
+    loop {
         let requests_next = if requests.is_empty() {
             pending().boxed_local()
         } else {
@@ -141,12 +200,10 @@ async fn start2(
                     queued_slots.insert(slot, block);
                 },
                 Some(Ok(Err(error))) => {
-                    error!(?error, "failed to get confirmed block");
-                    break;
+                    return Err(error).context("failed to get confirmed block");
                 },
                 Some(Err(error)) => {
-                    error!(?error, "failed to join spawned task");
-                    break;
+                    return Err(error).context("failed to join spawned task");
                 },
                 None => unreachable!(),
             },
@@ -175,13 +232,16 @@ async fn start2(
                         }
 
                         if !queued_slots_backfilled && block.get_slot() > next_confirmed_slot {
-                            if block.get_slot() - next_confirmed_slot > rpc_getblock_max_concurrency as u64 {
-                                error!(slot = block.get_slot(), next_confirmed_slot, rpc_getblock_max_concurrency, "backfill is too big");
-                                shutdown.shutdown();
-                                break 'outer
-                            }
-
                             queued_slots_backfilled = true;
+
+                            anyhow::ensure!(
+                                block.get_slot() - next_confirmed_slot <= rpc_getblock_max_concurrency as u64,
+                                "backfill is too big: slot {} / next_confirmed_slot {} / rpc_getblock_max_concurrency {}",
+                                block.get_slot(),
+                                next_confirmed_slot,
+                                rpc_getblock_max_concurrency,
+                            );
+
                             for slot in next_confirmed_slot..block.get_slot() {
                                 get_confirmed_block(&mut requests, slot);
                             }
@@ -200,7 +260,7 @@ async fn start2(
                         }
                     }
                 }
-                None => break,
+                None => return Ok(()),
             }
         }
 
@@ -210,6 +270,4 @@ async fn start2(
             next_confirmed_slot += 1;
         }
     }
-
-    Ok(())
 }
