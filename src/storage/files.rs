@@ -111,8 +111,7 @@ impl StorageFiles {
         };
 
         let file = &mut self.files[file_index];
-        let offset = file.head;
-        let _buffer = file
+        let (offset, _buffer) = file
             .write(buffer)
             .await
             .with_context(|| format!("failed to write block to file {:?}", file.path))?;
@@ -126,14 +125,22 @@ impl StorageFiles {
         let Some(block) = blocks.pop_block().await? else {
             anyhow::bail!("no blocks to remove");
         };
+        if block.size == 0 {
+            return Ok(());
+        }
 
         let Some(file_index) = self.id2file.get(&block.storage_id).copied() else {
             anyhow::bail!("unknown storage id: {}", block.storage_id);
         };
         let file = &mut self.files[file_index];
 
-        anyhow::ensure!(file.tail == block.offset, "tail / block.offset mismatch");
-        file.tail = (file.tail + block.size) % file.size;
+        file.tail = block.size + block.offset;
+        anyhow::ensure!(
+            file.tail <= file.size,
+            "file storage tail overflow, {} vs {}",
+            file.tail,
+            file.size
+        );
 
         Ok(())
     }
@@ -170,18 +177,31 @@ impl StorageFile {
         if self.head < self.tail {
             self.tail - self.head
         } else {
-            self.size - self.head
+            self.tail.max(self.size - self.head)
         }
     }
 
-    async fn write(&mut self, buffer: Vec<u8>) -> anyhow::Result<Vec<u8>> {
-        anyhow::ensure!(self.free_space() >= buffer.len() as u64, "not enough space");
+    async fn write(&mut self, buffer: Vec<u8>) -> anyhow::Result<(u64, Vec<u8>)> {
+        let len = buffer.len() as u64;
+        anyhow::ensure!(self.free_space() >= len, "not enough space");
+
+        // update head if not enough space
+        if self.head > self.tail && self.size - self.head < len {
+            self.head = 0;
+        }
 
         let (result, buffer) = self.file.write_all_at(buffer, self.head).await;
         let () = result?;
 
-        self.head = (self.head + buffer.len() as u64) % self.size;
+        let offset = self.head;
+        self.head += len;
+        anyhow::ensure!(
+            self.head <= self.size,
+            "file storage head overflow, {} vs {}",
+            self.head,
+            self.size
+        );
 
-        Ok(buffer)
+        Ok((offset, buffer))
     }
 }

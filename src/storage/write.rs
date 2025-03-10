@@ -35,7 +35,7 @@ use {
 };
 
 pub fn start(
-    config: ConfigStorage,
+    mut config: ConfigStorage,
     rpc_tx: mpsc::Sender<RpcRequest>,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
@@ -50,8 +50,9 @@ pub fn start(
                 let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
                 let rpc = RpcSourceConnected::new(rpc_tx);
 
+                let blocks_files = std::mem::take(&mut config.blocks.files);
                 let mut blocks = StoredBlockHeaders::open(config.blocks).await?;
-                let mut files = StorageFiles::open(config.files, &blocks).await?;
+                let mut files = StorageFiles::open(blocks_files, &blocks).await?;
                 let memory_storage = MemoryStorage::default();
 
                 let result = start2(
@@ -133,8 +134,6 @@ async fn start2(
     // fill the gap between stored and new
     let mut next_confirmed_slot = rpc.get_slot_confirmed().await?;
     if let Some(slot) = blocks.get_latest_slot() {
-        tracing::info!(slot, next_confirmed_slot, "latest");
-
         let mut next_confirmed_slot_last_update = Instant::now();
         let mut next_request_slot = slot + 1;
         let mut next_database_slot = slot + 1;

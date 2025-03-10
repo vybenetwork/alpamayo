@@ -115,7 +115,6 @@ pub enum ConfigSourceStreamKind {
 #[serde(deny_unknown_fields)]
 pub struct ConfigStorage {
     pub blocks: ConfigStorageBlocks,
-    pub files: Vec<ConfigStorageFile>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +138,7 @@ pub struct ConfigStorageBlocks {
         default = "ConfigStorageBlocks::default_rpc_getblock_max_concurrency"
     )]
     pub rpc_getblock_max_concurrency: usize,
+    pub files: Vec<ConfigStorageFile>,
 }
 
 impl ConfigStorageBlocks {

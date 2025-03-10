@@ -110,7 +110,7 @@ impl SlotInfo {
     fn new(slot: Slot) -> Self {
         Self {
             slot,
-            status: SlotStatusProto::SlotProcessed,
+            status: SlotStatusProto::SlotCreatedBank,
             parent: None,
             transactions: Vec::with_capacity(8_192),
             block_meta: None,
@@ -244,12 +244,14 @@ impl Stream for StreamSource {
                         ..
                     })) => {
                         let status = match SlotStatusProto::try_from(status) {
-                            Ok(SlotStatusProto::SlotProcessed) => SlotStatusProto::SlotProcessed,
+                            Ok(SlotStatusProto::SlotProcessed) => continue,
                             Ok(SlotStatusProto::SlotConfirmed) => SlotStatusProto::SlotConfirmed,
                             Ok(SlotStatusProto::SlotFinalized) => SlotStatusProto::SlotFinalized,
                             Ok(SlotStatusProto::SlotFirstShredReceived) => continue,
                             Ok(SlotStatusProto::SlotCompleted) => continue,
-                            Ok(SlotStatusProto::SlotCreatedBank) => continue,
+                            Ok(SlotStatusProto::SlotCreatedBank) => {
+                                SlotStatusProto::SlotCreatedBank
+                            }
                             Ok(SlotStatusProto::SlotDead) => SlotStatusProto::SlotDead,
                             Err(_error) => {
                                 return Poll::Ready(Some(Err(RecvError::UnknownCommitmentLevel(
@@ -259,7 +261,7 @@ impl Stream for StreamSource {
                         };
 
                         // store first processed slot
-                        if status == SlotStatusProto::SlotProcessed
+                        if status == SlotStatusProto::SlotCreatedBank
                             && this.first_processed.is_none()
                         {
                             this.first_processed = Some(slot);
@@ -297,9 +299,9 @@ impl Stream for StreamSource {
                         let slot_info = entry.or_insert_with(|| SlotInfo::new(slot));
 
                         // store parent and drop message (only processed)
-                        if status == SlotStatusProto::SlotProcessed {
+                        if status == SlotStatusProto::SlotCreatedBank {
                             if slot_info.parent.is_none()
-                                && slot_info.status == SlotStatusProto::SlotProcessed
+                                && slot_info.status == SlotStatusProto::SlotCreatedBank
                             {
                                 if let Some(parent) = parent {
                                     slot_info.parent = Some(parent);
@@ -320,7 +322,7 @@ impl Stream for StreamSource {
                         let parent = match (slot_info.parent, slot_info.status, status) {
                             (
                                 Some(parent),
-                                SlotStatusProto::SlotProcessed,
+                                SlotStatusProto::SlotCreatedBank,
                                 SlotStatusProto::SlotDead,
                             ) => {
                                 slot_info.status = SlotStatusProto::SlotDead;
@@ -328,7 +330,7 @@ impl Stream for StreamSource {
                             }
                             (
                                 Some(parent),
-                                SlotStatusProto::SlotProcessed,
+                                SlotStatusProto::SlotCreatedBank,
                                 SlotStatusProto::SlotConfirmed,
                             ) => {
                                 slot_info.status = SlotStatusProto::SlotConfirmed;
