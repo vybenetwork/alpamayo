@@ -5,10 +5,12 @@ use {
         storage::{blocks::StoredBlockHeaders, util},
     },
     anyhow::Context,
-    futures::future::{join_all, try_join_all},
+    futures::future::{FutureExt, LocalBoxFuture, join_all, try_join_all},
     solana_sdk::clock::Slot,
-    std::{collections::HashMap, io, path::PathBuf},
+    std::{collections::HashMap, io, rc::Rc},
+    tokio::task::yield_now,
     tokio_uring::fs::File,
+    tracing::error,
 };
 
 pub type StorageId = u32;
@@ -23,7 +25,7 @@ pub struct StorageFiles {
 impl StorageFiles {
     pub async fn open(
         configs: Vec<ConfigStorageFile>,
-        blocks: &StoredBlockHeaders,
+        blocks_headers: &StoredBlockHeaders,
     ) -> anyhow::Result<Self> {
         let mut files = try_join_all(configs.into_iter().map(Self::open_file)).await?;
         files.sort_unstable_by_key(|file| file.id);
@@ -35,14 +37,18 @@ impl StorageFiles {
         }
 
         // set tail and head
-        let mut boundaries = blocks.get_stored_boundaries();
+        let mut boundaries = blocks_headers.get_stored_boundaries();
         for (storage_id, index) in id2file.iter() {
             if let Some(boundaries) = boundaries.remove(storage_id) {
                 let file = &mut files[*index];
                 file.tail = boundaries.tail().unwrap_or_default();
-                anyhow::ensure!(file.tail < file.size, "invalid tail for {:?}", file.path);
+                anyhow::ensure!(
+                    file.tail < file.size,
+                    "invalid tail for file id#{}",
+                    file.id
+                );
                 file.head = boundaries.head().unwrap_or_default();
-                anyhow::ensure!(file.head <= file.size, "invalid head for {:?}", file.path);
+                anyhow::ensure!(file.head <= file.size, "invalid head for id#{}", file.id);
             }
         }
         anyhow::ensure!(boundaries.is_empty(), "file storage is missed");
@@ -72,8 +78,7 @@ impl StorageFiles {
 
         Ok(StorageFile {
             id: config.id,
-            path: config.path,
-            file,
+            file: Rc::new(file),
             tail: 0,
             head: 0,
             size: config.size,
@@ -82,7 +87,15 @@ impl StorageFiles {
 
     pub async fn close(self) {
         join_all(self.files.into_iter().map(|file| async move {
-            let _: io::Result<()> = file.file.close().await;
+            while Rc::strong_count(&file.file) > 1 {
+                yield_now().await;
+            }
+
+            if let Some(file) = Rc::into_inner(file.file) {
+                let _: io::Result<()> = file.close().await;
+            } else {
+                error!("Rc::into_inner fail for id#{}", file.id);
+            }
         }))
         .await;
     }
@@ -91,14 +104,14 @@ impl StorageFiles {
         &mut self,
         slot: Slot,
         block: Option<ConfirmedBlockWithBinary>,
-        blocks: &mut StoredBlockHeaders,
+        blocks_headers: &mut StoredBlockHeaders,
     ) -> anyhow::Result<()> {
-        if blocks.is_full() {
-            self.pop_block(blocks).await?;
+        if blocks_headers.is_full() {
+            self.pop_block(blocks_headers).await?;
         }
 
         let Some(mut block) = block else {
-            return blocks.push_block_dead(slot).await;
+            return blocks_headers.push_block_dead(slot).await;
         };
         let buffer = block.take_buffer();
         let buffer_size = buffer.len() as u64;
@@ -106,7 +119,7 @@ impl StorageFiles {
         let file_index = loop {
             match self.get_file_index_for_new_block(buffer_size) {
                 Some(index) => break index,
-                None => self.pop_block(blocks).await?,
+                None => self.pop_block(blocks_headers).await?,
             }
         };
 
@@ -114,15 +127,15 @@ impl StorageFiles {
         let (offset, _buffer) = file
             .write(buffer)
             .await
-            .with_context(|| format!("failed to write block to file {:?}", file.path))?;
+            .with_context(|| format!("failed to write block to file id#{}", file.id))?;
 
-        blocks
+        blocks_headers
             .push_block_confirmed(slot, block.block_time, file.id, offset, buffer_size)
             .await
     }
 
-    async fn pop_block(&mut self, blocks: &mut StoredBlockHeaders) -> anyhow::Result<()> {
-        let Some(block) = blocks.pop_block().await? else {
+    async fn pop_block(&mut self, blocks_headers: &mut StoredBlockHeaders) -> anyhow::Result<()> {
+        let Some(block) = blocks_headers.pop_block().await? else {
             anyhow::bail!("no blocks to remove");
         };
         if block.size == 0 {
@@ -160,13 +173,41 @@ impl StorageFiles {
             }
         }
     }
+
+    pub fn read<'a>(
+        &self,
+        storage_id: StorageId,
+        offset: u64,
+        size: u64,
+    ) -> LocalBoxFuture<'a, io::Result<Vec<u8>>> {
+        let file = self
+            .id2file
+            .get(&storage_id)
+            .and_then(|index| self.files.get(*index))
+            .map(|file| Rc::clone(&file.file));
+
+        async move {
+            let Some(file) = file else {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to get file for id#{storage_id}"),
+                ));
+            };
+
+            let buffer = Vec::with_capacity(size as usize);
+            let (res, buffer) = file.read_exact_at(buffer, offset).await;
+            res?;
+
+            Ok(buffer)
+        }
+        .boxed_local()
+    }
 }
 
 #[derive(Debug)]
 struct StorageFile {
     id: StorageId,
-    path: PathBuf,
-    file: File,
+    file: Rc<File>,
     tail: u64,
     head: u64,
     size: u64,

@@ -181,6 +181,30 @@ impl StoredBlockHeaders {
 
         Ok(Some(block.into()))
     }
+
+    pub fn get_block_location(&self, slot: Slot) -> StorageBlockHeaderLocationResult {
+        let tail = self.blocks[self.tail];
+        if !tail.exists || tail.slot > slot {
+            return StorageBlockHeaderLocationResult::Removed;
+        }
+
+        let head = self.blocks[self.head];
+        if !head.exists || head.slot < slot {
+            return StorageBlockHeaderLocationResult::NotAvailable;
+        }
+
+        let index = (self.tail + (slot - tail.slot) as usize) % self.blocks.len();
+        let block = self.blocks[index];
+        if block.exists && block.slot == slot {
+            if block.dead {
+                StorageBlockHeaderLocationResult::Dead
+            } else {
+                StorageBlockHeaderLocationResult::Found(block.into())
+            }
+        } else {
+            StorageBlockHeaderLocationResult::SlotMismatch
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -372,4 +396,13 @@ impl From<StoredBlockHeader> for StorageBlockHeaderLocation {
             size: block.size,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum StorageBlockHeaderLocationResult {
+    Removed,      // block is not available anymore
+    Dead,         // skipped or forked block for this slot
+    NotAvailable, // not confirmed yet
+    SlotMismatch,
+    Found(StorageBlockHeaderLocation),
 }

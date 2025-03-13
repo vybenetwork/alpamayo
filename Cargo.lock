@@ -116,6 +116,7 @@ dependencies = [
 name = "alpamayo"
 version = "0.1.0"
 dependencies = [
+ "affinity",
  "anyhow",
  "base64 0.22.1",
  "bitflags 2.9.0",
@@ -124,9 +125,14 @@ dependencies = [
  "clap",
  "futures",
  "git-version",
+ "http-body-util",
  "human-size",
  "humantime-serde",
+ "hyper 1.6.0",
+ "hyper-util",
  "json5",
+ "jsonrpc-core",
+ "jsonrpsee-types",
  "lazy_static",
  "libc",
  "maplit",
@@ -136,10 +142,12 @@ dependencies = [
  "richat-proto",
  "richat-shared",
  "serde",
+ "serde_json",
  "serde_yaml",
  "signal-hook",
  "solana-client",
  "solana-rpc-client",
+ "solana-rpc-client-api",
  "solana-sdk",
  "solana-storage-proto",
  "solana-transaction-status",
@@ -1933,12 +1941,12 @@ dependencies = [
 
 [[package]]
 name = "http-body-util"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "793429d76616a256bcb62c2a2ec2bed781c8307e797e2598c50010f2bee2544f"
+checksum = "b021d93e26becf5dc7e1b75b1bed1fd93124b374ceb73f43d4d4eafec896a64a"
 dependencies = [
  "bytes",
- "futures-util",
+ "futures-core",
  "http 1.2.0",
  "http-body 1.0.1",
  "pin-project-lite",
@@ -2388,6 +2396,18 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+]
+
+[[package]]
+name = "jsonrpsee-types"
+version = "0.24.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ddb81adb1a5ae9182df379e374a79e24e992334e7346af4d065ae5b2acb8d4c6"
+dependencies = [
+ "http 1.2.0",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -5978,9 +5998,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-rustls"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f6d0975eaace0cf0fcadee4e4aaa5da15b5c079146f2cffb67c113be122bf37"
+checksum = "8e727b36a1a0e8b74c376ac2211e40c2c8af09fb4013c60d910495810f008e9b"
 dependencies = [
  "rustls 0.23.23",
  "tokio",
@@ -6108,7 +6128,7 @@ dependencies = [
  "rustls-pemfile 2.2.0",
  "socket2 0.5.8",
  "tokio",
- "tokio-rustls 0.26.1",
+ "tokio-rustls 0.26.2",
  "tokio-stream",
  "tower 0.4.13",
  "tower-layer",

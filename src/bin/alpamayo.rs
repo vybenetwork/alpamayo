@@ -1,5 +1,5 @@
 use {
-    alpamayo::{config::Config, metrics, storage},
+    alpamayo::{config::Config, metrics, rpc, storage},
     anyhow::Context,
     clap::Parser,
     futures::future::{FutureExt, TryFutureExt, ready, try_join_all},
@@ -32,7 +32,7 @@ struct Args {
 
 fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let config = Config::load_from_file(&args.config)
+    let mut config = Config::load_from_file(&args.config)
         .with_context(|| format!("failed to load config from {}", args.config))?;
 
     // Setup logs
@@ -47,59 +47,81 @@ fn main() -> anyhow::Result<()> {
     // Shutdown channel/flag
     let shutdown = Shutdown::new();
 
-    // Create source / storage channels
+    // Source / storage channels
     let stream_start = Arc::new(Notify::new());
     let (stream_tx, stream_rx) = mpsc::channel(2_048);
     let (rpc_tx, rpc_rx) = mpsc::channel(2_048);
 
-    // Create global runtime
-    let app_rt_jh = thread::Builder::new().name("appTokio".to_owned()).spawn({
-        let stream_start = Arc::clone(&stream_start);
-        let shutdown = shutdown.clone();
-        move || {
-            let runtime = config.tokio.build_runtime("appTokioRt")?;
-            runtime.block_on(async move {
-                let source_fut = tokio::spawn(storage::source::start(
-                    config.source,
-                    rpc_rx,
-                    stream_start,
-                    stream_tx,
-                    shutdown.clone(),
-                ))
-                .map_err(Into::into)
-                .and_then(ready)
-                .boxed();
+    // Storage / rpc channels
+    let (read_requests_tx, read_requests_rx) = mpsc::channel(config.rpc.request_channel_capacity);
 
-                let metrics_fut = if let Some(config) = config.metrics {
-                    metrics::spawn_server(config, shutdown)
-                        .await?
-                        .map_err(anyhow::Error::from)
-                        .boxed()
-                } else {
-                    ready(Ok(())).boxed()
-                };
+    // Create source runtime
+    let source_jh = thread::Builder::new()
+        .name("sourceTokio".to_owned())
+        .spawn({
+            let stream_start = Arc::clone(&stream_start);
+            let shutdown = shutdown.clone();
+            move || {
+                let runtime =
+                    std::mem::take(&mut config.source.tokio).build_runtime("sourceTokioRt")?;
+                runtime.block_on(async move {
+                    let source_fut = tokio::spawn(storage::source::start(
+                        config.source,
+                        rpc_rx,
+                        stream_start,
+                        stream_tx,
+                        shutdown.clone(),
+                    ))
+                    .map_err(Into::into)
+                    .and_then(ready)
+                    .boxed();
 
-                try_join_all(vec![source_fut, metrics_fut])
-                    .await
-                    .map(|_| ())
-            })
-        }
-    })?;
+                    let metrics_fut = if let Some(config) = config.metrics {
+                        metrics::spawn_server(config, shutdown)
+                            .await?
+                            .map_err(anyhow::Error::from)
+                            .boxed()
+                    } else {
+                        ready(Ok(())).boxed()
+                    };
 
-    // Storage runtimes
+                    try_join_all(vec![source_fut, metrics_fut])
+                        .await
+                        .map(|_| ())
+                })
+            }
+        })?;
+
+    // Storage runtime
     let storage_write_jh = storage::write::start(
         config.storage,
         rpc_tx,
         stream_start,
         stream_rx,
+        read_requests_rx,
         shutdown.clone(),
     )?;
+
+    // RPC runtime
+    let rpc_jh = thread::Builder::new().name("rpcTokio".to_owned()).spawn({
+        let shutdown = shutdown.clone();
+        move || {
+            let runtime = std::mem::take(&mut config.rpc.tokio).build_runtime("rpcTokioRt")?;
+            runtime.block_on(async move {
+                rpc::server::spawn(config.rpc, read_requests_tx, shutdown.clone())
+                    .await?
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })
+        }
+    })?;
 
     // Shutdown loop
     let mut signals = Signals::new([SIGINT])?;
     let mut threads = [
-        ("appTokio", Some(app_rt_jh)),
+        ("source", Some(source_jh)),
         ("storageWrite", Some(storage_write_jh)),
+        ("rpc", Some(rpc_jh)),
     ];
     'outer: while threads.iter().any(|th| th.1.is_some()) {
         for signal in signals.pending() {

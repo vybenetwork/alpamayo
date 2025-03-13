@@ -3,10 +3,10 @@ logs:
   json: false
 metrics:
   endpoint: 127.0.0.1:8001
-tokio:
-  worker_threads: 4
-  affinity: 0-3
 source:
+  tokio:
+    worker_threads: 2
+    affinity: 0-1
   rpc:
     url: http://127.0.0.1:8899/
     timeout: 30s
@@ -32,3 +32,25 @@ source:
       send: ["gzip", "zstd"]
     x_token: null
 storage:
+  affinity: 2
+  read_requests_concurrency: 128
+  blocks:
+    max: 1_000
+    path: ./db/blocks
+    rpc_getblock_max_retries: 10
+    rpc_getblock_backoff_init: 100ms
+    rpc_getblock_max_concurrency: 15
+    files:
+      - id: 0
+        path: ./db/storage0
+        size: 8gb
+rpc:
+  endpoint: 127.0.0.1:9000
+  tokio:
+    worker_threads: 2
+    affinity: 3-4
+  body_limit: 50KiB
+  request_timeout: 60s
+  calls:
+    - getBlock
+  request_channel_capacity: 4096

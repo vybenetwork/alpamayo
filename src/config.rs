@@ -2,7 +2,7 @@ use {
     crate::storage::files::StorageId,
     human_size::Size,
     richat_client::grpc::ConfigGrpcClient,
-    richat_shared::config::{ConfigTokio, deserialize_num_str},
+    richat_shared::config::{ConfigTokio, deserialize_affinity, deserialize_num_str},
     serde::{
         Deserialize,
         de::{self, Deserializer},
@@ -23,14 +23,13 @@ pub struct Config {
     pub logs: ConfigLogs,
     #[serde(default)]
     pub metrics: Option<ConfigMetrics>,
-    /// Global Tokio runtime: receive new data, handle metrics requests
-    #[serde(default)]
-    pub tokio: ConfigTokio,
     /// Rpc & Stream data sources
     #[serde(default)]
     pub source: ConfigSource,
     /// Storage
     pub storage: ConfigStorage,
+    /// RPC
+    pub rpc: ConfigRpc,
 }
 
 impl Config {
@@ -71,6 +70,9 @@ impl Default for ConfigMetrics {
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConfigSource {
+    /// Tokio runtime: subscribe on new data, rpc requests, metrics server
+    #[serde(default)]
+    pub tokio: ConfigTokio,
     pub rpc: ConfigSourceRpc,
     pub stream: ConfigSourceStream,
 }
@@ -114,7 +116,21 @@ pub enum ConfigSourceStreamKind {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigStorage {
+    /// Thread affinity
+    #[serde(default, deserialize_with = "deserialize_affinity")]
+    pub affinity: Option<Vec<usize>>,
+    #[serde(
+        default = "ConfigStorage::default_read_requests_concurrency",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub read_requests_concurrency: usize,
     pub blocks: ConfigStorageBlocks,
+}
+
+impl ConfigStorage {
+    const fn default_read_requests_concurrency() -> usize {
+        128
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,18 +140,18 @@ pub struct ConfigStorageBlocks {
     pub max: usize,
     pub path: PathBuf,
     #[serde(
-        deserialize_with = "deserialize_num_str",
-        default = "ConfigStorageBlocks::default_rpc_getblock_max_retries"
+        default = "ConfigStorageBlocks::default_rpc_getblock_max_retries",
+        deserialize_with = "deserialize_num_str"
     )]
     pub rpc_getblock_max_retries: usize,
     #[serde(
-        with = "humantime_serde",
-        default = "ConfigStorageBlocks::default_rpc_getblock_backoff_init"
+        default = "ConfigStorageBlocks::default_rpc_getblock_backoff_init",
+        with = "humantime_serde"
     )]
     pub rpc_getblock_backoff_init: Duration,
     #[serde(
-        deserialize_with = "deserialize_num_str",
-        default = "ConfigStorageBlocks::default_rpc_getblock_max_concurrency"
+        default = "ConfigStorageBlocks::default_rpc_getblock_max_concurrency",
+        deserialize_with = "deserialize_num_str"
     )]
     pub rpc_getblock_max_concurrency: usize,
     pub files: Vec<ConfigStorageFile>,
@@ -164,6 +180,56 @@ pub struct ConfigStorageFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigRpc {
+    /// Endpoint of RPC service
+    pub endpoint: SocketAddr,
+    /// Tokio runtime for RPC
+    #[serde(default)]
+    pub tokio: ConfigTokio,
+    #[serde(
+        default = "ConfigRpc::default_body_limit",
+        deserialize_with = "deserialize_humansize_usize"
+    )]
+    /// Max body size limit in bytes
+    pub body_limit: usize,
+    /// Request timeout
+    #[serde(
+        default = "ConfigRpc::default_request_timeout",
+        with = "humantime_serde"
+    )]
+    pub request_timeout: Duration,
+    /// Supported RPC calls
+    pub calls: Vec<ConfigRpcCall>,
+    /// Max number of requests in the queue
+    #[serde(
+        default = "ConfigRpc::default_request_channel_capacity",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub request_channel_capacity: usize,
+}
+
+impl ConfigRpc {
+    const fn default_body_limit() -> usize {
+        50 * 1024 // 50KiB
+    }
+
+    const fn default_request_timeout() -> Duration {
+        Duration::from_secs(60)
+    }
+
+    const fn default_request_channel_capacity() -> usize {
+        4096
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub enum ConfigRpcCall {
+    GetBlock,
+}
+
 fn deserialize_humansize<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: Deserializer<'de>,
@@ -173,4 +239,11 @@ where
     Size::from_str(size)
         .map(|size| size.to_bytes())
         .map_err(|error| de::Error::custom(format!("failed to parse size {size:?}: {error}")))
+}
+
+fn deserialize_humansize_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_humansize(deserializer).map(|value| value as usize)
 }

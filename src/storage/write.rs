@@ -10,12 +10,13 @@ use {
             blocks::StoredBlockHeaders,
             files::StorageFiles,
             memory::{MemoryConfirmedBlock, MemoryStorage},
+            read::{ReadRequest, ReadRequestPostCheck},
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
     },
     anyhow::Context,
     futures::{
-        future::{FutureExt, pending},
+        future::{FutureExt, LocalBoxFuture, pending},
         stream::{FuturesUnordered, StreamExt},
     },
     richat_shared::shutdown::Shutdown,
@@ -39,38 +40,47 @@ pub fn start(
     rpc_tx: mpsc::Sender<RpcRequest>,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
+    requests_rx: mpsc::Receiver<ReadRequest>,
     shutdown: Shutdown,
 ) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
     thread::Builder::new()
         .name("storageWrite".to_owned())
         .spawn(move || {
             tokio_uring::start(async move {
+                if let Some(cpus) = config.affinity {
+                    affinity::set_thread_affinity(&cpus).expect("failed to set affinity")
+                }
+
                 let rpc_getblock_max_retries = config.blocks.rpc_getblock_max_retries;
                 let rpc_getblock_backoff_init = config.blocks.rpc_getblock_backoff_init;
                 let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
                 let rpc = RpcSourceConnected::new(rpc_tx);
 
                 let blocks_files = std::mem::take(&mut config.blocks.files);
-                let mut blocks = StoredBlockHeaders::open(config.blocks).await?;
-                let mut files = StorageFiles::open(blocks_files, &blocks).await?;
+                let mut blocks_headers = StoredBlockHeaders::open(config.blocks).await?;
+                let mut blocks_files = StorageFiles::open(blocks_files, &blocks_headers).await?;
                 let memory_storage = MemoryStorage::default();
 
-                let result = start2(
+                let (mut read_requests, result) = start2(
                     rpc_getblock_max_retries,
                     rpc_getblock_backoff_init,
                     rpc_getblock_max_concurrency,
                     rpc,
                     stream_start,
                     stream_rx,
-                    &mut blocks,
-                    &mut files,
+                    requests_rx,
+                    config.read_requests_concurrency,
+                    &mut blocks_headers,
+                    &mut blocks_files,
                     memory_storage,
                     shutdown,
                 )
                 .await;
 
-                blocks.close().await;
-                files.close().await;
+                while read_requests.next().await.is_some() {}
+
+                blocks_headers.close().await;
+                blocks_files.close().await;
 
                 result
             })
@@ -79,22 +89,29 @@ pub fn start(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn start2(
+async fn start2<'a>(
     rpc_getblock_max_retries: usize,
     rpc_getblock_backoff_init: Duration,
     rpc_getblock_max_concurrency: usize,
     rpc: RpcSourceConnected,
     stream_start: Arc<Notify>,
     mut stream_rx: mpsc::Receiver<StreamSourceMessage>,
-    blocks: &mut StoredBlockHeaders,
-    files: &mut StorageFiles,
+    mut read_requests_rx: mpsc::Receiver<ReadRequest>,
+    read_requests_concurrency: usize,
+    blocks_headers: &mut StoredBlockHeaders,
+    blocks_files: &mut StorageFiles,
     mut memory_storage: MemoryStorage,
     shutdown: Shutdown,
-) -> anyhow::Result<()> {
+) -> (
+    FuturesUnordered<LocalBoxFuture<'a, ReadRequestPostCheck>>,
+    anyhow::Result<()>,
+) {
+    let mut read_requests = FuturesUnordered::new();
+
     // get block requests
-    let mut requests = FuturesUnordered::new();
+    let mut rpc_requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
-    let get_confirmed_block = |requests: &mut FuturesUnordered<
+    let get_confirmed_block = |rpc_requests: &mut FuturesUnordered<
         JoinHandle<
             Result<(u64, Option<ConfirmedBlockWithBinary>), RpcSourceConnectedError<GetBlockError>>,
         >,
@@ -103,7 +120,7 @@ async fn start2(
         let mut max_retries = rpc_getblock_max_retries;
         let mut backoff_wait = rpc_getblock_backoff_init;
         let rpc = rpc.clone();
-        requests.push(spawn_local(async move {
+        rpc_requests.push(spawn_local(async move {
             loop {
                 match rpc.get_block(slot).await {
                     Ok(block) => return Ok((slot, Some(block))),
@@ -132,17 +149,22 @@ async fn start2(
     let mut queued_slots_backfilled = false;
 
     // fill the gap between stored and new
-    let mut next_confirmed_slot = rpc.get_slot_confirmed().await?;
-    if let Some(slot) = blocks.get_latest_slot() {
+    let mut next_confirmed_slot = match rpc.get_slot_confirmed().await {
+        Ok(slot) => slot,
+        Err(error) => return (read_requests, Err(error.into())),
+    };
+    if let Some(slot) = blocks_headers.get_latest_slot() {
         let mut next_confirmed_slot_last_update = Instant::now();
-        let mut next_request_slot = slot + 1;
+        let mut next_rpc_request_slot = slot + 1;
         let mut next_database_slot = slot + 1;
-        let mut requests_in_flight = 0;
 
         loop {
             // update confirmed slot every 3s
             if next_confirmed_slot_last_update.elapsed() > Duration::from_secs(3) {
-                next_confirmed_slot = rpc.get_slot_confirmed().await?;
+                next_confirmed_slot = match rpc.get_slot_confirmed().await {
+                    Ok(slot) => slot,
+                    Err(error) => return (read_requests, Err(error.into())),
+                };
                 next_confirmed_slot_last_update = Instant::now();
             }
 
@@ -152,31 +174,40 @@ async fn start2(
             }
 
             // get blocks
-            while next_request_slot <= next_confirmed_slot
-                && requests_in_flight < rpc_getblock_max_concurrency
+            while next_rpc_request_slot <= next_confirmed_slot
+                && rpc_requests.len() < rpc_getblock_max_concurrency
             {
-                get_confirmed_block(&mut requests, next_request_slot);
-                next_request_slot += 1;
-                requests_in_flight += 1;
+                get_confirmed_block(&mut rpc_requests, next_rpc_request_slot);
+                next_rpc_request_slot += 1;
             }
 
             // push block into the queue
-            match requests.next().await {
+            match rpc_requests.next().await {
                 Some(Ok(Ok((slot, block)))) => {
-                    requests_in_flight -= 1;
                     queued_slots.insert(slot, block);
                 }
                 Some(Ok(Err(error))) => {
-                    return Err(error).context("failed to get confirmed block");
+                    return (
+                        read_requests,
+                        Err(error).context("failed to get confirmed block"),
+                    );
                 }
                 Some(Err(error)) => {
-                    return Err(error).context("failed to join spawned task");
+                    return (
+                        read_requests,
+                        Err(error).context("failed to join spawned task"),
+                    );
                 }
                 None => unreachable!(),
             }
 
             while let Some(block) = queued_slots.remove(&next_database_slot) {
-                files.push_block(next_database_slot, block, blocks).await?;
+                if let Err(error) = blocks_files
+                    .push_block(next_database_slot, block, blocks_headers)
+                    .await
+                {
+                    return (read_requests, Err(error));
+                }
                 next_database_slot += 1;
             }
         }
@@ -185,24 +216,36 @@ async fn start2(
 
     tokio::pin!(shutdown);
     loop {
-        let requests_next = if requests.is_empty() {
+        let rpc_requests_next = if rpc_requests.is_empty() {
             pending().boxed_local()
         } else {
-            requests.next().boxed_local()
+            rpc_requests.next().boxed_local()
+        };
+
+        let read_requests_next = if read_requests.len() < read_requests_concurrency {
+            read_requests_rx.recv().boxed_local()
+        } else {
+            pending().boxed_local()
+        };
+
+        let read_request_fut = if read_requests.is_empty() {
+            pending().boxed_local()
+        } else {
+            read_requests.next().boxed_local()
         };
 
         tokio::select! {
-            () = &mut shutdown => return Ok(()),
+            biased;
             // insert block requested from rpc
-            message = requests_next => match message {
+            message = rpc_requests_next => match message {
                 Some(Ok(Ok((slot, block)))) => {
                     queued_slots.insert(slot, block);
                 },
                 Some(Ok(Err(error))) => {
-                    return Err(error).context("failed to get confirmed block");
+                    return (read_requests, Err(error).context("failed to get confirmed block"));
                 },
                 Some(Err(error)) => {
-                    return Err(error).context("failed to join spawned task");
+                    return (read_requests, Err(error).context("failed to join spawned task"));
                 },
                 None => unreachable!(),
             },
@@ -233,22 +276,23 @@ async fn start2(
                         if !queued_slots_backfilled && block.get_slot() > next_confirmed_slot {
                             queued_slots_backfilled = true;
 
-                            anyhow::ensure!(
-                                block.get_slot() - next_confirmed_slot <= rpc_getblock_max_concurrency as u64,
-                                "backfill is too big: slot {} / next_confirmed_slot {} / rpc_getblock_max_concurrency {}",
-                                block.get_slot(),
-                                next_confirmed_slot,
-                                rpc_getblock_max_concurrency,
-                            );
+                            if block.get_slot() - next_confirmed_slot > rpc_getblock_max_concurrency as u64 {
+                                return (read_requests, Err(anyhow::anyhow!(
+                                    "backfill is too big: slot {} / next_confirmed_slot {} / rpc_getblock_max_concurrency {}",
+                                    block.get_slot(),
+                                    next_confirmed_slot,
+                                    rpc_getblock_max_concurrency,
+                                )))
+                            }
 
                             for slot in next_confirmed_slot..block.get_slot() {
-                                get_confirmed_block(&mut requests, slot);
+                                get_confirmed_block(&mut rpc_requests, slot);
                             }
                         }
 
                         match block {
                             MemoryConfirmedBlock::Missed { slot } => {
-                                get_confirmed_block(&mut requests, slot);
+                                get_confirmed_block(&mut rpc_requests, slot);
                             },
                             MemoryConfirmedBlock::Dead { slot } => {
                                 queued_slots.insert(slot, None);
@@ -259,13 +303,37 @@ async fn start2(
                         }
                     }
                 }
-                None => return Ok(()),
-            }
+                None => return (read_requests, Ok(())),
+            },
+            // process read request
+            message = read_request_fut => match message {
+                Some(result) => {
+                    result.verify(blocks_headers);
+                    continue;
+                },
+                None => unreachable!(),
+            },
+            // process NEW read request
+            message = read_requests_next => match message {
+                Some(request) => {
+                    if let Some(future) = request.process(blocks_files, blocks_headers) {
+                        read_requests.push(future);
+                    }
+                    continue;
+                },
+                None => return (read_requests, Ok(())),
+            },
+            () = &mut shutdown => return (read_requests, Ok(())),
         }
 
         // save blocks
         while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
-            files.push_block(next_confirmed_slot, block, blocks).await?;
+            if let Err(error) = blocks_files
+                .push_block(next_confirmed_slot, block, blocks_headers)
+                .await
+            {
+                return (read_requests, Err(error));
+            }
             next_confirmed_slot += 1;
         }
     }
