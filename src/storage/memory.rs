@@ -5,12 +5,14 @@ use {
 
 #[derive(Debug)]
 pub enum MemoryConfirmedBlock {
+    // we don't received info about that block
     Missed {
         slot: Slot,
-    }, // we don't receive info about that block
+    },
+    // block is dead
     Dead {
         slot: Slot,
-    }, // block is dead
+    },
     Block {
         slot: Slot,
         block: ConfirmedBlockWithBinary,

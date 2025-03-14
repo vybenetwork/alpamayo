@@ -1,9 +1,11 @@
 use {
     prost::Message,
-    solana_sdk::signature::Signature,
+    solana_sdk::{
+        clock::{Slot, UnixTimestamp},
+        signature::Signature,
+    },
     solana_storage_proto::convert::generated,
     solana_transaction_status::{ConfirmedBlock, TransactionWithStatusMeta},
-    std::ops::Deref,
     thiserror::Error,
 };
 
@@ -15,38 +17,23 @@ pub enum SerializeBlockError {
 
 #[derive(Debug)]
 pub struct ConfirmedBlockWithBinary {
-    block: ConfirmedBlock,
+    pub parent_slot: Slot,
+    pub block_time: Option<UnixTimestamp>,
     buffer: Vec<u8>,
-}
-
-impl AsRef<ConfirmedBlock> for ConfirmedBlockWithBinary {
-    fn as_ref(&self) -> &ConfirmedBlock {
-        &self.block
-    }
-}
-
-impl Deref for ConfirmedBlockWithBinary {
-    type Target = ConfirmedBlock;
-
-    fn deref(&self) -> &Self::Target {
-        &self.block
-    }
 }
 
 impl ConfirmedBlockWithBinary {
     pub fn new(block: ConfirmedBlock) -> Result<Self, SerializeBlockError> {
-        let buffer = Self::serialize(&block)?;
-        Ok(Self { block, buffer })
-    }
+        let parent_slot = block.parent_slot;
+        let block_time = block.block_time;
 
-    fn serialize(block: &ConfirmedBlock) -> Result<Vec<u8>, SerializeBlockError> {
         let mut transactions = Vec::with_capacity(block.transactions.len());
-        for transaction in block.transactions.iter() {
+        for transaction in block.transactions {
             match transaction {
                 TransactionWithStatusMeta::MissingMetadata(tx) => {
                     return Err(SerializeBlockError::MissingMetadata(tx.signatures[0]));
                 }
-                TransactionWithStatusMeta::Complete(tx) => transactions.push(tx.clone().into()),
+                TransactionWithStatusMeta::Complete(tx) => transactions.push(tx.into()),
             }
         }
 
@@ -64,8 +51,13 @@ impl ConfirmedBlockWithBinary {
                 .block_height
                 .map(|block_height| generated::BlockHeight { block_height }),
         };
+        let buffer = block.encode_to_vec();
 
-        Ok(block.encode_to_vec())
+        Ok(Self {
+            parent_slot,
+            block_time,
+            buffer,
+        })
     }
 
     pub fn take_buffer(&mut self) -> Vec<u8> {
