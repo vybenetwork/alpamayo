@@ -54,3 +54,9 @@ rpc:
   calls:
     - getBlock
   request_channel_capacity: 4096
+  upstream:
+    endpoint: http://127.0.0.1:8899
+    user_agent: alpamayo/v0.1.0
+    version: HTTP/1.1
+    retries_max: 3
+    retries_backoff_init: 100ms

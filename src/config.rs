@@ -1,6 +1,7 @@
 use {
-    crate::storage::files::StorageId,
+    crate::{storage::files::StorageId, version::VERSION},
     human_size::Size,
+    reqwest::Version,
     richat_client::grpc::ConfigGrpcClient,
     richat_shared::config::{ConfigTokio, deserialize_affinity, deserialize_num_str},
     serde::{
@@ -208,6 +209,9 @@ pub struct ConfigRpc {
         deserialize_with = "deserialize_num_str"
     )]
     pub request_channel_capacity: usize,
+    /// In case of removed data upstream would be used to fetch block
+    #[serde(default)]
+    pub upstream: Option<ConfigRpcUpstream>,
 }
 
 impl ConfigRpc {
@@ -228,6 +232,52 @@ impl ConfigRpc {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub enum ConfigRpcCall {
     GetBlock,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigRpcUpstream {
+    pub endpoint: String,
+    pub user_agent: String,
+    #[serde(deserialize_with = "ConfigRpcUpstream::deserialize_version")]
+    pub version: Version,
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub retries_max: usize,
+    #[serde(with = "humantime_serde")]
+    pub retries_backoff_init: Duration,
+}
+
+impl Default for ConfigRpcUpstream {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:8899".to_owned(),
+            user_agent: format!("alpamayo/v{}", VERSION.package),
+            version: Version::default(),
+            retries_max: 3,
+            retries_backoff_init: Duration::from_millis(100),
+        }
+    }
+}
+
+impl ConfigRpcUpstream {
+    fn deserialize_version<'de, D>(deserializer: D) -> Result<Version, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "HTTP/0.9" => Version::HTTP_09,
+            "HTTP/1.0" => Version::HTTP_10,
+            "HTTP/1.1" => Version::HTTP_11,
+            "HTTP/2.0" => Version::HTTP_2,
+            "HTTP/3.0" => Version::HTTP_3,
+            value => {
+                return Err(de::Error::custom(format!(
+                    "unknown HTTP version: {}",
+                    value
+                )));
+            }
+        })
+    }
 }
 
 fn deserialize_humansize<'de, D>(deserializer: D) -> Result<u64, D::Error>

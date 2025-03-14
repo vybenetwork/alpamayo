@@ -7,6 +7,7 @@ use {
         server::conn::auto::Builder as ServerBuilder,
     },
     richat_shared::shutdown::Shutdown,
+    std::sync::Arc,
     tokio::{net::TcpListener, sync::mpsc, task::JoinError},
     tracing::{debug, error, info},
 };
@@ -19,7 +20,7 @@ pub async fn spawn(
     let listener = TcpListener::bind(config.endpoint).await?;
     info!("start server at: {}", config.endpoint);
 
-    let api_solana_state = api_solana::State::new(config, requests_tx)?;
+    let api_solana_state = Arc::new(api_solana::State::new(config, requests_tx)?);
 
     Ok(tokio::spawn(async move {
         let http = ServerBuilder::new(TokioExecutor::new());
@@ -42,9 +43,9 @@ pub async fn spawn(
             };
 
             let service = service_fn({
-                let api_solana_state = api_solana_state.clone();
+                let api_solana_state = Arc::clone(&api_solana_state);
                 move |req: Request<BodyIncoming>| {
-                    let api_solana_state = api_solana_state.clone();
+                    let api_solana_state = Arc::clone(&api_solana_state);
                     async move {
                         if req.uri().path() == "/" {
                             api_solana::on_request(req, api_solana_state).await

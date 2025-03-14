@@ -1,6 +1,7 @@
 use {
     crate::{
         config::{ConfigRpc, ConfigRpcCall},
+        rpc::upstream::RpcClient,
         storage::read::{ReadRequest, ReadResultGetBlock},
     },
     futures::{StreamExt, stream::FuturesOrdered},
@@ -26,6 +27,7 @@ use {
     solana_transaction_status::{BlockEncodingOptions, ConfirmedBlock, UiTransactionEncoding},
     std::{
         fmt,
+        sync::Arc,
         time::{Duration, Instant},
     },
     tokio::sync::{mpsc, oneshot},
@@ -87,12 +89,13 @@ impl SupportedCalls {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct State {
     body_limit: usize,
     request_timeout: Duration,
     supported_calls: SupportedCalls,
     requests_tx: mpsc::Sender<ReadRequest>,
+    upstream: Option<RpcClient>,
 }
 
 impl State {
@@ -102,18 +105,17 @@ impl State {
             request_timeout: config.request_timeout,
             supported_calls: SupportedCalls::new(&config.calls)?,
             requests_tx,
+            upstream: config.upstream.map(RpcClient::new).transpose()?,
         })
     }
 }
 
 pub async fn on_request(
     req: hyper::Request<BodyIncoming>,
-    state: State,
+    state: Arc<State>,
 ) -> HttpResult<RpcResponse> {
-    let bytes = match Limited::new(req.into_body(), state.body_limit)
-        .collect()
-        .await
-    {
+    let (parts, body) = req.into_parts();
+    let bytes = match Limited::new(body, state.body_limit).collect().await {
         Ok(body) => body.to_bytes(),
         Err(error) => return response_400(error),
     };
@@ -123,9 +125,14 @@ pub async fn on_request(
         Err(error) => return response_400(error),
     };
     let now = Instant::now();
+    let upstream_enabled = parts
+        .headers
+        .get("x-upstream-disabled")
+        .map(|value| value != "true")
+        .unwrap_or(true);
     let mut buffer = match requests {
         RpcRequests::Single(request) => match RpcRequest::parse(request, &state, now) {
-            Ok(request) => match request.process().await {
+            Ok(request) => match request.process(upstream_enabled).await {
                 Ok(response) => {
                     serde_json::to_vec(&response).expect("json serialization never fail")
                 }
@@ -139,7 +146,7 @@ pub async fn on_request(
                 let state = state.clone();
                 futures.push_back(async move {
                     match RpcRequest::parse(request, &state, now) {
-                        Ok(request) => request.process().await,
+                        Ok(request) => request.process(upstream_enabled).await,
                         Err(error) => Ok(error),
                     }
                 });
@@ -186,10 +193,11 @@ impl<'a> RpcRequests<'a> {
 
 enum RpcRequest {
     GetBlock {
-        state: State,
+        state: Arc<State>,
         deadline: Instant,
         id: Id<'static>,
         slot: Slot,
+        commitment: CommitmentConfig,
         encoding: UiTransactionEncoding,
         encoding_options: BlockEncodingOptions,
     },
@@ -198,7 +206,7 @@ enum RpcRequest {
 impl RpcRequest {
     fn parse<'a>(
         request: Request<'a>,
-        state: &State,
+        state: &Arc<State>,
         now: Instant,
     ) -> Result<Self, Response<'a, serde_json::Value>> {
         match request.method.as_ref() {
@@ -231,10 +239,11 @@ impl RpcRequest {
                 }
 
                 Ok(Self::GetBlock {
-                    state: state.clone(),
+                    state: Arc::clone(state),
                     deadline: now + state.request_timeout,
                     id: id.into_owned(),
                     slot,
+                    commitment,
                     encoding,
                     encoding_options,
                 })
@@ -275,13 +284,17 @@ impl RpcRequest {
         Ok(())
     }
 
-    async fn process(self) -> anyhow::Result<Response<'static, serde_json::Value>> {
+    async fn process(
+        self,
+        upstream_enabled: bool,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
         match self {
             Self::GetBlock {
                 state,
                 deadline,
                 id,
                 slot,
+                commitment,
                 encoding,
                 encoding_options,
             } => {
@@ -302,10 +315,26 @@ impl RpcRequest {
                 let bytes = match result {
                     ReadResultGetBlock::Timeout => anyhow::bail!("timeout"),
                     ReadResultGetBlock::Removed => {
-                        return Ok(jsonrpc_response_error(
-                            id,
-                            RpcCustomError::LongTermStorageSlotSkipped { slot },
-                        ));
+                        if let Some(upstream) = upstream_enabled
+                            .then_some(state.upstream.as_ref())
+                            .flatten()
+                        {
+                            return upstream
+                                .get_block(
+                                    deadline,
+                                    id,
+                                    slot,
+                                    commitment,
+                                    encoding,
+                                    encoding_options,
+                                )
+                                .await;
+                        } else {
+                            return Ok(jsonrpc_response_error(
+                                id,
+                                RpcCustomError::LongTermStorageSlotSkipped { slot },
+                            ));
+                        }
                     }
                     ReadResultGetBlock::Dead => {
                         return Ok(jsonrpc_response_error(
