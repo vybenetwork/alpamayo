@@ -1,6 +1,6 @@
 use {
     crate::source::block::ConfirmedBlockWithBinary, solana_sdk::clock::Slot,
-    std::collections::VecDeque,
+    std::collections::VecDeque, tracing::error,
 };
 
 #[derive(Debug)]
@@ -42,6 +42,7 @@ struct BlockInfo {
     slot: Slot,
     block: Option<ConfirmedBlockWithBinary>,
     dead: bool,
+    confirmed: bool,
 }
 
 impl BlockInfo {
@@ -50,6 +51,7 @@ impl BlockInfo {
             slot,
             block: Some(block),
             dead: false,
+            confirmed: false,
         }
     }
 
@@ -58,6 +60,7 @@ impl BlockInfo {
             slot,
             block: None,
             dead: false,
+            confirmed: false,
         }
     }
 }
@@ -99,9 +102,9 @@ impl MemoryStorage {
     }
 
     pub fn set_dead(&mut self, slot: Slot) {
-        if let Some(first) = self.blocks.front() {
-            if first.slot <= slot {
-                let index = (slot - first.slot) as usize;
+        if let Some(first_block) = self.blocks.front() {
+            if first_block.slot <= slot {
+                let index = (slot - first_block.slot) as usize;
                 if let Some(info) = self.blocks.get_mut(index) {
                     info.dead = true;
                 }
@@ -111,6 +114,14 @@ impl MemoryStorage {
 
     pub fn set_confirmed(&mut self, slot: Slot) {
         assert!(self.confirmed < slot, "attempt to backward confirmed");
+        if let Some(first_block) = self.blocks.front() {
+            if first_block.slot <= slot {
+                let index = (slot - first_block.slot) as usize;
+                if let Some(info) = self.blocks.get_mut(index) {
+                    info.confirmed = true;
+                }
+            }
+        }
         self.confirmed = slot;
     }
 
@@ -123,51 +134,82 @@ impl MemoryStorage {
         // get first slot
         let first_slot = self.blocks.front().map(|b| b.slot)?;
 
-        // generate missed blocks
+        // initialize gen_next_slot
         if self.gen_next_slot == 0 {
             self.gen_next_slot = self.confirmed.min(first_slot);
         }
-        if self.gen_next_slot < self.confirmed.min(first_slot) {
-            let slot = self.gen_next_slot;
-            self.gen_next_slot += 1;
-            return Some(MemoryConfirmedBlock::Missed { slot });
-        }
+
+        // we don't have slots yet
         if self.confirmed < first_slot {
             return None;
         }
-        assert!(self.gen_next_slot == first_slot, "blocks overlap");
 
-        // missed or dead if we don't have blocks
-        if self.confirmed > self.blocks[self.blocks.len() - 1].slot {
-            self.gen_next_slot += 1;
-            let BlockInfo { slot, dead, .. } = self.blocks.pop_front().expect("existed");
-            return Some(MemoryConfirmedBlock::missed_or_dead(slot, dead));
-        }
+        let mut confirmed_index = self
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(index, block)| block.confirmed.then_some(index))?;
 
-        //
-        let mut index = (self.confirmed - first_slot) as usize;
         let block = loop {
-            // block found, return
-            if index == 0 {
-                let BlockInfo { slot, block, dead } = self.blocks.pop_front().expect("existed");
-                break match block {
-                    Some(block) => MemoryConfirmedBlock::Block { slot, block },
-                    None => MemoryConfirmedBlock::missed_or_dead(slot, dead),
-                };
-            }
+            match &self.blocks[confirmed_index].block {
+                Some(block) => {
+                    // update confirmed index
+                    if first_slot <= block.parent_slot {
+                        confirmed_index = (block.parent_slot - first_slot) as usize;
+                        continue;
+                    }
 
-            // try to get parent
-            match &self.blocks[index].block {
-                Some(block) if first_slot <= block.parent_slot => {
-                    index = (block.parent_slot - first_slot) as usize;
-                    continue;
+                    // we don't have info about block
+                    if self.gen_next_slot <= block.parent_slot {
+                        let slot = self.gen_next_slot;
+                        break MemoryConfirmedBlock::Missed { slot };
+                    }
+
+                    // missed slots
+                    if self.gen_next_slot < first_slot {
+                        let slot = self.gen_next_slot;
+                        break MemoryConfirmedBlock::Dead { slot };
+                    }
+
+                    // missed if not marked as dead
+                    if self.gen_next_slot == first_slot {
+                        let BlockInfo {
+                            slot, block, dead, ..
+                        } = self.blocks.pop_front().expect("existed");
+                        break if let Some(block) = block {
+                            MemoryConfirmedBlock::Block { slot, block }
+                        } else {
+                            MemoryConfirmedBlock::missed_or_dead(slot, dead)
+                        };
+                    }
+
+                    error!(
+                        gen_next_slot = self.gen_next_slot,
+                        "unexpected gen_next_slot for confirmed_index, 1"
+                    );
                 }
-                _ => {}
+                None => {
+                    // we don't have any info, definitely missed
+                    if self.gen_next_slot < first_slot {
+                        let slot = self.gen_next_slot;
+                        break MemoryConfirmedBlock::Missed { slot };
+                    }
+
+                    // missed if not marked as dead
+                    if self.gen_next_slot == first_slot {
+                        let BlockInfo { slot, dead, .. } =
+                            self.blocks.pop_front().expect("existed");
+                        break MemoryConfirmedBlock::missed_or_dead(slot, dead);
+                    }
+
+                    error!(
+                        gen_next_slot = self.gen_next_slot,
+                        "unexpected gen_next_slot for confirmed_index, 2"
+                    );
+                }
             }
 
-            // in case of failed parent return dead/missed
-            let BlockInfo { slot, dead, .. } = self.blocks.pop_front().expect("existed");
-            break MemoryConfirmedBlock::missed_or_dead(slot, dead);
+            return None;
         };
 
         self.gen_next_slot += 1;

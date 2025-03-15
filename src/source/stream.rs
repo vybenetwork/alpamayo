@@ -24,7 +24,7 @@ use {
         task::{Context, Poll},
     },
     thiserror::Error,
-    tracing::{error, info},
+    tracing::{info, warn},
 };
 
 #[derive(Debug, Error)]
@@ -91,7 +91,7 @@ struct SlotInfo {
 impl Drop for SlotInfo {
     fn drop(&mut self) {
         if !self.sealed && !self.ignore_block_build_fail {
-            error!(
+            warn!(
                 slot = self.slot,
                 status = ?self.status,
                 parent = self.parent,

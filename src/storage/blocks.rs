@@ -199,10 +199,9 @@ impl StoredBlockHeaders {
             StoredBlockHeader::new_noexists(),
         );
 
-        stored_slots.stored.store(
-            self.front_slot().unwrap_or(u64::MAX),
-            Ordering::SeqCst,
-        );
+        stored_slots
+            .stored
+            .store(self.front_slot().unwrap_or(u64::MAX), Ordering::SeqCst);
 
         self.sync(self.tail).await?;
 
