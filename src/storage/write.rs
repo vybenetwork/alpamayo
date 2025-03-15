@@ -11,6 +11,7 @@ use {
             files::StorageFiles,
             memory::{MemoryConfirmedBlock, MemoryStorage},
             read::{ReadRequest, ReadRequestPostCheck},
+            slots::StoredSlots,
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
     },
@@ -23,7 +24,7 @@ use {
     solana_sdk::clock::Slot,
     std::{
         collections::HashMap,
-        sync::Arc,
+        sync::{Arc, atomic::Ordering},
         thread,
         time::{Duration, Instant},
     },
@@ -37,6 +38,7 @@ use {
 
 pub fn start(
     mut config: ConfigStorage,
+    stored_slots: StoredSlots,
     rpc_tx: mpsc::Sender<RpcRequest>,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
@@ -61,7 +63,13 @@ pub fn start(
                 let mut blocks_files = StorageFiles::open(blocks_files, &blocks_headers).await?;
                 let memory_storage = MemoryStorage::default();
 
+                stored_slots.stored.store(
+                    blocks_headers.front_slot().unwrap_or(u64::MAX),
+                    Ordering::SeqCst,
+                );
+
                 let (mut read_requests, result) = start2(
+                    stored_slots,
                     rpc_getblock_max_retries,
                     rpc_getblock_backoff_init,
                     rpc_getblock_max_concurrency,
@@ -90,6 +98,7 @@ pub fn start(
 
 #[allow(clippy::too_many_arguments)]
 async fn start2<'a>(
+    stored_slots: StoredSlots,
     rpc_getblock_max_retries: usize,
     rpc_getblock_backoff_init: Duration,
     rpc_getblock_max_concurrency: usize,
@@ -203,7 +212,7 @@ async fn start2<'a>(
 
             while let Some(block) = queued_slots.remove(&next_database_slot) {
                 if let Err(error) = blocks_files
-                    .push_block(next_database_slot, block, blocks_headers)
+                    .push_block(next_database_slot, block, blocks_headers, &stored_slots)
                     .await
                 {
                     return (read_requests, Err(error));
@@ -256,13 +265,15 @@ async fn start2<'a>(
                     match message {
                         StreamSourceMessage::Block { slot, block } => {
                             memory_storage.add_processed(slot, block);
+                            stored_slots.processed.store(slot, Ordering::SeqCst);
                         }
                         StreamSourceMessage::SlotStatus { slot, status, .. } => {
-                            if status == StreamSourceSlotStatus::Dead {
-                                memory_storage.set_dead(slot);
-                            }
-                            if status == StreamSourceSlotStatus::Confirmed {
-                                memory_storage.set_confirmed(slot);
+                            match status {
+                                StreamSourceSlotStatus::Dead => memory_storage.set_dead(slot),
+                                StreamSourceSlotStatus::Confirmed => memory_storage.set_confirmed(slot),
+                                StreamSourceSlotStatus::Finalized =>  {
+                                    stored_slots.finalized.store(slot, Ordering::Relaxed);
+                                }
                             }
                         }
                     }
@@ -329,7 +340,7 @@ async fn start2<'a>(
         // save blocks
         while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
             if let Err(error) = blocks_files
-                .push_block(next_confirmed_slot, block, blocks_headers)
+                .push_block(next_confirmed_slot, block, blocks_headers, &stored_slots)
                 .await
             {
                 return (read_requests, Err(error));

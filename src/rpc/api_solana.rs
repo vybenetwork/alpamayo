@@ -2,7 +2,10 @@ use {
     crate::{
         config::{ConfigRpc, ConfigRpcCall},
         rpc::upstream::RpcClient,
-        storage::read::{ReadRequest, ReadResultGetBlock},
+        storage::{
+            read::{ReadRequest, ReadResultGetBlock},
+            slots::StoredSlots,
+        },
     },
     futures::{StreamExt, stream::FuturesOrdered},
     http_body_util::{BodyExt, Full as BodyFull, Limited, combinators::BoxBody},
@@ -91,6 +94,7 @@ impl SupportedCalls {
 
 #[derive(Debug)]
 pub struct State {
+    stored_slots: StoredSlots,
     body_limit: usize,
     request_timeout: Duration,
     supported_calls: SupportedCalls,
@@ -99,14 +103,23 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(config: ConfigRpc, requests_tx: mpsc::Sender<ReadRequest>) -> anyhow::Result<Self> {
+    pub fn new(
+        config: ConfigRpc,
+        stored_slots: StoredSlots,
+        requests_tx: mpsc::Sender<ReadRequest>,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
+            stored_slots,
             body_limit: config.body_limit,
             request_timeout: config.request_timeout,
             supported_calls: SupportedCalls::new(&config.calls)?,
             requests_tx,
             upstream: config.upstream.map(RpcClient::new).transpose()?,
         })
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.stored_slots.is_ready()
     }
 }
 

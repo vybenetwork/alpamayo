@@ -1,6 +1,10 @@
 use {
-    crate::{config::ConfigRpc, rpc::api_solana, storage::read::ReadRequest},
-    http_body_util::{BodyExt, Empty as BodyEmpty},
+    crate::{
+        config::ConfigRpc,
+        rpc::api_solana,
+        storage::{read::ReadRequest, slots::StoredSlots},
+    },
+    http_body_util::{BodyExt, Empty as BodyEmpty, Full as BodyFull},
     hyper::{Request, Response, StatusCode, body::Incoming as BodyIncoming, service::service_fn},
     hyper_util::{
         rt::tokio::{TokioExecutor, TokioIo},
@@ -14,13 +18,14 @@ use {
 
 pub async fn spawn(
     config: ConfigRpc,
+    stored_slots: StoredSlots,
     requests_tx: mpsc::Sender<ReadRequest>,
     shutdown: Shutdown,
 ) -> anyhow::Result<impl Future<Output = Result<(), JoinError>>> {
     let listener = TcpListener::bind(config.endpoint).await?;
     info!("start server at: {}", config.endpoint);
 
-    let api_solana_state = Arc::new(api_solana::State::new(config, requests_tx)?);
+    let api_solana_state = Arc::new(api_solana::State::new(config, stored_slots, requests_tx)?);
 
     Ok(tokio::spawn(async move {
         let http = ServerBuilder::new(TokioExecutor::new());
@@ -47,12 +52,20 @@ pub async fn spawn(
                 move |req: Request<BodyIncoming>| {
                     let api_solana_state = Arc::clone(&api_solana_state);
                     async move {
-                        if req.uri().path() == "/" {
-                            api_solana::on_request(req, api_solana_state).await
-                        } else {
-                            Response::builder()
+                        match req.uri().path() {
+                            "/" => api_solana::on_request(req, api_solana_state).await,
+                            "/ready" => {
+                                if api_solana_state.is_ready() {
+                                    Response::builder().body(BodyFull::from("OK").boxed())
+                                } else {
+                                    Response::builder()
+                                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                        .body(BodyEmpty::new().boxed())
+                                }
+                            }
+                            _ => Response::builder()
                                 .status(StatusCode::NOT_FOUND)
-                                .body(BodyEmpty::new().boxed())
+                                .body(BodyEmpty::new().boxed()),
                         }
                     }
                 }

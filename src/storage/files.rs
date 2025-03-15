@@ -2,12 +2,12 @@ use {
     crate::{
         config::ConfigStorageFile,
         source::block::ConfirmedBlockWithBinary,
-        storage::{blocks::StoredBlockHeaders, util},
+        storage::{blocks::StoredBlockHeaders, slots::StoredSlots, util},
     },
     anyhow::Context,
     futures::future::{FutureExt, LocalBoxFuture, join_all, try_join_all},
     solana_sdk::clock::Slot,
-    std::{collections::HashMap, io, rc::Rc},
+    std::{collections::HashMap, io, rc::Rc, sync::atomic::Ordering},
     tokio::task::yield_now,
     tokio_uring::fs::File,
     tracing::error,
@@ -105,13 +105,16 @@ impl StorageFiles {
         slot: Slot,
         block: Option<ConfirmedBlockWithBinary>,
         blocks_headers: &mut StoredBlockHeaders,
+        stored_slots: &StoredSlots,
     ) -> anyhow::Result<()> {
         if blocks_headers.is_full() {
-            self.pop_block(blocks_headers).await?;
+            self.pop_block(blocks_headers, stored_slots).await?;
         }
 
         let Some(mut block) = block else {
-            return blocks_headers.push_block_dead(slot).await;
+            blocks_headers.push_block_dead(slot, stored_slots).await?;
+            stored_slots.confirmed.store(slot, Ordering::SeqCst);
+            return Ok(());
         };
         let buffer = block.take_buffer();
         let buffer_size = buffer.len() as u64;
@@ -119,7 +122,7 @@ impl StorageFiles {
         let file_index = loop {
             match self.get_file_index_for_new_block(buffer_size) {
                 Some(index) => break index,
-                None => self.pop_block(blocks_headers).await?,
+                None => self.pop_block(blocks_headers, stored_slots).await?,
             }
         };
 
@@ -130,14 +133,30 @@ impl StorageFiles {
             .with_context(|| format!("failed to write block to file id#{}", file.id))?;
 
         blocks_headers
-            .push_block_confirmed(slot, block.block_time, file.id, offset, buffer_size)
-            .await
+            .push_block_confirmed(
+                slot,
+                block.block_time,
+                file.id,
+                offset,
+                buffer_size,
+                stored_slots,
+            )
+            .await?;
+
+        stored_slots.confirmed.store(slot, Ordering::SeqCst);
+
+        Ok(())
     }
 
-    async fn pop_block(&mut self, blocks_headers: &mut StoredBlockHeaders) -> anyhow::Result<()> {
-        let Some(block) = blocks_headers.pop_block().await? else {
+    async fn pop_block(
+        &mut self,
+        blocks_headers: &mut StoredBlockHeaders,
+        stored_slots: &StoredSlots,
+    ) -> anyhow::Result<()> {
+        let Some(block) = blocks_headers.pop_block(stored_slots).await? else {
             anyhow::bail!("no blocks to remove");
         };
+
         if block.size == 0 {
             return Ok(());
         }

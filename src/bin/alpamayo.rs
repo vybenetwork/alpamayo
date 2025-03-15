@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
     let (rpc_tx, rpc_rx) = mpsc::channel(2_048);
 
     // Storage / rpc channels
+    let stored_slots = storage::slots::StoredSlots::default();
     let (read_requests_tx, read_requests_rx) = mpsc::channel(config.rpc.request_channel_capacity);
 
     // Create source runtime
@@ -95,6 +96,7 @@ fn main() -> anyhow::Result<()> {
     // Storage runtime
     let storage_write_jh = storage::write::start(
         config.storage,
+        stored_slots.clone(),
         rpc_tx,
         stream_start,
         stream_rx,
@@ -108,7 +110,7 @@ fn main() -> anyhow::Result<()> {
         move || {
             let runtime = std::mem::take(&mut config.rpc.tokio).build_runtime("rpcTokioRt")?;
             runtime.block_on(async move {
-                rpc::server::spawn(config.rpc, read_requests_tx, shutdown.clone())
+                rpc::server::spawn(config.rpc, stored_slots, read_requests_tx, shutdown.clone())
                     .await?
                     .await?;
                 Ok::<(), anyhow::Error>(())

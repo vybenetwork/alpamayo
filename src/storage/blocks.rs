@@ -1,12 +1,12 @@
 use {
     crate::{
         config::ConfigStorageBlocks,
-        storage::{files::StorageId, util},
+        storage::{files::StorageId, slots::StoredSlots, util},
     },
     anyhow::Context,
     bitflags::bitflags,
     solana_sdk::clock::{Slot, UnixTimestamp},
-    std::{collections::HashMap, io},
+    std::{collections::HashMap, io, sync::atomic::Ordering},
     thiserror::Error,
     tokio_uring::fs::File,
 };
@@ -95,7 +95,7 @@ impl StoredBlockHeaders {
         let head = iter
             .max_by_key(|(_index, block)| block.slot)
             .map(|(index, _block)| index)
-            .unwrap_or_default();
+            .unwrap_or_else(|| blocks.len() - 1);
 
         Ok((blocks, tail, head))
     }
@@ -139,17 +139,35 @@ impl StoredBlockHeaders {
         Ok(())
     }
 
-    async fn push_block(&mut self, block: StoredBlockHeader) -> anyhow::Result<()> {
+    async fn push_block(
+        &mut self,
+        block: StoredBlockHeader,
+        stored_slots: &StoredSlots,
+    ) -> anyhow::Result<()> {
         self.head = (self.head + 1) % self.blocks.len();
         anyhow::ensure!(!self.blocks[self.head].exists, "no free slot");
         self.blocks[self.head] = block;
         self.sync(self.head)
             .await
-            .map_err(|error| anyhow::anyhow!("failed to sync block headers: {error:?}"))
+            .map_err(|error| anyhow::anyhow!("failed to sync block headers: {error:?}"))?;
+
+        // update stored if db was initialized
+        if self.tail == 0 {
+            if let Some(slot) = self.front_slot() {
+                stored_slots.stored.store(slot, Ordering::SeqCst);
+            }
+        }
+
+        Ok(())
     }
 
-    pub async fn push_block_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
-        self.push_block(StoredBlockHeader::new_dead(slot)).await
+    pub async fn push_block_dead(
+        &mut self,
+        slot: Slot,
+        stored_slots: &StoredSlots,
+    ) -> anyhow::Result<()> {
+        self.push_block(StoredBlockHeader::new_dead(slot), stored_slots)
+            .await
     }
 
     pub async fn push_block_confirmed(
@@ -159,14 +177,19 @@ impl StoredBlockHeaders {
         storage_id: StorageId,
         offset: u64,
         block_size: u64,
+        stored_slots: &StoredSlots,
     ) -> anyhow::Result<()> {
-        self.push_block(StoredBlockHeader::new_confirmed(
-            slot, block_time, storage_id, offset, block_size,
-        ))
+        self.push_block(
+            StoredBlockHeader::new_confirmed(slot, block_time, storage_id, offset, block_size),
+            stored_slots,
+        )
         .await
     }
 
-    pub async fn pop_block(&mut self) -> io::Result<Option<StorageBlockHeaderLocation>> {
+    pub async fn pop_block(
+        &mut self,
+        stored_slots: &StoredSlots,
+    ) -> io::Result<Option<StorageBlockHeaderLocation>> {
         if !self.blocks[self.tail].exists {
             return Ok(None);
         }
@@ -175,11 +198,29 @@ impl StoredBlockHeaders {
             &mut self.blocks[self.tail],
             StoredBlockHeader::new_noexists(),
         );
+
+        stored_slots.stored.store(
+            self.front_slot().unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
+
         self.sync(self.tail).await?;
 
         self.tail = (self.tail + 1) % self.blocks.len();
 
         Ok(Some(block.into()))
+    }
+
+    pub fn front_slot(&self) -> Option<Slot> {
+        let mut index = self.tail;
+        while index != self.head {
+            let block = &self.blocks[index];
+            if block.exists {
+                return Some(block.slot);
+            }
+            index = (index + 1) % self.blocks.len();
+        }
+        None
     }
 
     pub fn get_block_location(&self, slot: Slot) -> StorageBlockHeaderLocationResult {
