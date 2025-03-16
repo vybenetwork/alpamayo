@@ -22,7 +22,7 @@ use {
     prost::Message,
     serde::{Deserialize, de},
     solana_rpc_client_api::{
-        config::{RpcBlockConfig, RpcEncodingConfigWrapper},
+        config::{RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper},
         custom_error::RpcCustomError,
     },
     solana_sdk::{
@@ -217,6 +217,9 @@ enum RpcRequest {
         encoding: UiTransactionEncoding,
         encoding_options: BlockEncodingOptions,
     },
+    GetSlot {
+        response: anyhow::Result<Response<'static, serde_json::Value>>,
+    },
 }
 
 impl RpcRequest {
@@ -262,6 +265,40 @@ impl RpcRequest {
                     commitment,
                     encoding,
                     encoding_options,
+                })
+            }
+            "getSlot" => {
+                #[derive(Debug, Deserialize)]
+                struct ReqParams {
+                    #[serde(default)]
+                    config: Option<RpcContextConfig>,
+                }
+
+                let (id, ReqParams { config }) = Self::parse_params(request)?;
+                let RpcContextConfig {
+                    commitment,
+                    min_context_slot,
+                } = config.unwrap_or_default();
+
+                let slot = match commitment.unwrap_or_default().commitment {
+                    CommitmentLevel::Processed => state.stored_slots.processed_load(),
+                    CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
+                    CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
+                };
+
+                if let Some(min_context_slot) = min_context_slot {
+                    if slot < min_context_slot {
+                        return Ok(Self::GetSlot {
+                            response: Ok(jsonrpc_response_error(
+                                id.into_owned(),
+                                RpcCustomError::MinContextSlotNotReached { context_slot: slot },
+                            )),
+                        });
+                    }
+                }
+
+                Ok(Self::GetSlot {
+                    response: Self::response_success(id.into_owned(), slot.into()),
                 })
             }
             _ => Err(Response {
@@ -399,13 +436,21 @@ impl RpcRequest {
                 // serialize
                 let data = serde_json::to_value(&block).expect("json serialization never fail");
 
-                Ok(Response {
-                    jsonrpc: Some(TwoPointZero),
-                    payload: ResponsePayload::success(data),
-                    id,
-                })
+                Self::response_success(id, data)
             }
+            Self::GetSlot { response } => response,
         }
+    }
+
+    fn response_success(
+        id: Id<'static>,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        Ok(Response {
+            jsonrpc: Some(TwoPointZero),
+            payload: ResponsePayload::success(payload),
+            id,
+        })
     }
 
     fn get_block_error_not_available(

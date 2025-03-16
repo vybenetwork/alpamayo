@@ -33,7 +33,7 @@ impl StoredSlots {
             && self.stored_load() != u64::MAX
     }
 
-    fn processed_load(&self) -> Slot {
+    pub fn processed_load(&self) -> Slot {
         self.processed.load(Ordering::SeqCst)
     }
 

@@ -207,6 +207,10 @@ impl StoredBlockHeaders {
     }
 
     pub fn front_slot(&self) -> Option<Slot> {
+        if self.tail == 0 && self.head == self.blocks.len() - 1 {
+            return None;
+        }
+
         let mut index = self.tail;
         loop {
             let block = &self.blocks[index];
