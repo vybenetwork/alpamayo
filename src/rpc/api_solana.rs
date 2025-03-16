@@ -7,7 +7,7 @@ use {
             slots::StoredSlots,
         },
     },
-    futures::{StreamExt, stream::FuturesOrdered},
+    futures::stream::{FuturesOrdered, StreamExt},
     http_body_util::{BodyExt, Full as BodyFull, Limited, combinators::BoxBody},
     hyper::{
         StatusCode,
@@ -131,6 +131,13 @@ pub async fn on_request(
     state: Arc<State>,
 ) -> HttpResult<RpcResponse> {
     let (parts, body) = req.into_parts();
+
+    let upstream_enabled = parts
+        .headers
+        .get("x-upstream-disabled")
+        .map(|value| value != "true")
+        .unwrap_or(true);
+
     let bytes = match Limited::new(body, state.body_limit).collect().await {
         Ok(body) => body.to_bytes(),
         Err(error) => return response_400(error),
@@ -140,15 +147,9 @@ pub async fn on_request(
         Ok(requests) => requests,
         Err(error) => return response_400(error),
     };
-    let now = Instant::now();
-    let upstream_enabled = parts
-        .headers
-        .get("x-upstream-disabled")
-        .map(|value| value != "true")
-        .unwrap_or(true);
     let mut buffer = match requests {
-        RpcRequests::Single(request) => match RpcRequest::parse(request, &state, now) {
-            Ok(request) => match request.process(upstream_enabled).await {
+        RpcRequests::Single(request) => match RpcRequest::parse(request, &state) {
+            Ok(request) => match request.process(Arc::clone(&state), upstream_enabled).await {
                 Ok(response) => {
                     serde_json::to_vec(&response).expect("json serialization never fail")
                 }
@@ -161,8 +162,8 @@ pub async fn on_request(
             for request in requests {
                 let state = state.clone();
                 futures.push_back(async move {
-                    match RpcRequest::parse(request, &state, now) {
-                        Ok(request) => request.process(upstream_enabled).await,
+                    match RpcRequest::parse(request, &state) {
+                        Ok(request) => request.process(state, upstream_enabled).await,
                         Err(error) => Ok(error),
                     }
                 });
@@ -208,15 +209,7 @@ impl<'a> RpcRequests<'a> {
 }
 
 enum RpcRequest {
-    GetBlock {
-        state: Arc<State>,
-        deadline: Instant,
-        id: Id<'static>,
-        slot: Slot,
-        commitment: CommitmentConfig,
-        encoding: UiTransactionEncoding,
-        encoding_options: BlockEncodingOptions,
-    },
+    GetBlock(RpcRequestGetBlock),
     GetSlot {
         response: anyhow::Result<Response<'static, serde_json::Value>>,
     },
@@ -226,7 +219,6 @@ impl RpcRequest {
     fn parse<'a>(
         request: Request<'a>,
         state: &Arc<State>,
-        now: Instant,
     ) -> Result<Self, Response<'a, serde_json::Value>> {
         match request.method.as_ref() {
             "getBlock" if state.supported_calls.get_block => {
@@ -257,15 +249,13 @@ impl RpcRequest {
                     });
                 }
 
-                Ok(Self::GetBlock {
-                    state: Arc::clone(state),
-                    deadline: now + state.request_timeout,
+                Ok(Self::GetBlock(RpcRequestGetBlock {
                     id: id.into_owned(),
                     slot,
                     commitment,
                     encoding,
                     encoding_options,
-                })
+                }))
             }
             "getSlot" => {
                 #[derive(Debug, Deserialize)]
@@ -337,111 +327,6 @@ impl RpcRequest {
         Ok(())
     }
 
-    async fn process(
-        self,
-        upstream_enabled: bool,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
-        match self {
-            Self::GetBlock {
-                state,
-                deadline,
-                id,
-                slot,
-                commitment,
-                encoding,
-                encoding_options,
-            } => {
-                // check slot before sending request
-                let slot_tip = match commitment.commitment {
-                    CommitmentLevel::Processed => unreachable!(),
-                    CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
-                    CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
-                };
-                if slot > slot_tip {
-                    return Self::get_block_error_not_available(id, slot);
-                }
-                if slot <= state.stored_slots.stored_load() {
-                    return Self::get_block_error_skipped(id, slot);
-                }
-
-                // request
-                let (tx, rx) = oneshot::channel();
-                anyhow::ensure!(
-                    state
-                        .requests_tx
-                        .send(ReadRequest::GetBlock { deadline, slot, tx })
-                        .await
-                        .is_ok(),
-                    "request channel is closed"
-                );
-                let Ok(result) = rx.await else {
-                    anyhow::bail!("rx channel is closed");
-                };
-                let bytes = match result {
-                    ReadResultGetBlock::Timeout => anyhow::bail!("timeout"),
-                    ReadResultGetBlock::Removed => {
-                        if let Some(upstream) = upstream_enabled
-                            .then_some(state.upstream.as_ref())
-                            .flatten()
-                        {
-                            return upstream
-                                .get_block(
-                                    deadline,
-                                    id,
-                                    slot,
-                                    commitment,
-                                    encoding,
-                                    encoding_options,
-                                )
-                                .await;
-                        } else {
-                            return Self::get_block_error_skipped(id, slot);
-                        }
-                    }
-                    ReadResultGetBlock::Dead => {
-                        return Self::get_block_error_skipped(id, slot);
-                    }
-                    ReadResultGetBlock::NotAvailable => {
-                        return Self::get_block_error_not_available(id, slot);
-                    }
-                    ReadResultGetBlock::Block(bytes) => bytes,
-                    ReadResultGetBlock::ReadError(error) => anyhow::bail!("read error: {error}"),
-                };
-
-                // verify that we still have data for that block (i.e. we read correct data)
-                if slot <= state.stored_slots.stored_load() {
-                    return Self::get_block_error_skipped(id, slot);
-                }
-
-                // parse
-                let block = match generated::ConfirmedBlock::decode(bytes.as_ref()) {
-                    Ok(block) => match ConfirmedBlock::try_from(block) {
-                        Ok(block) => match block.encode_with_options(encoding, encoding_options) {
-                            Ok(block) => block,
-                            Err(error) => {
-                                return Ok(jsonrpc_response_error(id, RpcCustomError::from(error)));
-                            }
-                        },
-                        Err(error) => {
-                            error!(slot, ?error, "failed to decode block / bincode");
-                            anyhow::bail!("failed to decode block / bincode")
-                        }
-                    },
-                    Err(error) => {
-                        error!(slot, ?error, "failed to decode block / prost");
-                        anyhow::bail!("failed to decode block / prost")
-                    }
-                };
-
-                // serialize
-                let data = serde_json::to_value(&block).expect("json serialization never fail");
-
-                Self::response_success(id, data)
-            }
-            Self::GetSlot { response } => response,
-        }
-    }
-
     fn response_success(
         id: Id<'static>,
         payload: serde_json::Value,
@@ -453,7 +338,139 @@ impl RpcRequest {
         })
     }
 
-    fn get_block_error_not_available(
+    async fn process(
+        self,
+        state: Arc<State>,
+        upstream_enabled: bool,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        match self {
+            Self::GetBlock(request) => request.process(state, upstream_enabled).await,
+            Self::GetSlot { response } => response,
+        }
+    }
+}
+
+struct RpcRequestGetBlock {
+    id: Id<'static>,
+    slot: Slot,
+    commitment: CommitmentConfig,
+    encoding: UiTransactionEncoding,
+    encoding_options: BlockEncodingOptions,
+}
+
+impl RpcRequestGetBlock {
+    async fn process(
+        self,
+        state: Arc<State>,
+        upstream_enabled: bool,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        let deadline = Instant::now() + state.request_timeout;
+
+        // check slot before sending request
+        let slot_tip = match self.commitment.commitment {
+            CommitmentLevel::Processed => unreachable!(),
+            CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
+            CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
+        };
+        if self.slot > slot_tip {
+            return Self::error_not_available(self.id, self.slot);
+        }
+        if self.slot <= state.stored_slots.stored_load() {
+            return self.fetch_upstream(state, upstream_enabled, deadline).await;
+        }
+
+        // request
+        let (tx, rx) = oneshot::channel();
+        anyhow::ensure!(
+            state
+                .requests_tx
+                .send(ReadRequest::GetBlock {
+                    deadline,
+                    slot: self.slot,
+                    tx
+                })
+                .await
+                .is_ok(),
+            "request channel is closed"
+        );
+        let Ok(result) = rx.await else {
+            anyhow::bail!("rx channel is closed");
+        };
+        let bytes = match result {
+            ReadResultGetBlock::Timeout => anyhow::bail!("timeout"),
+            ReadResultGetBlock::Removed => {
+                return self.fetch_upstream(state, upstream_enabled, deadline).await;
+            }
+            ReadResultGetBlock::Dead => {
+                return Self::error_skipped(self.id, self.slot);
+            }
+            ReadResultGetBlock::NotAvailable => {
+                return Self::error_not_available(self.id, self.slot);
+            }
+            ReadResultGetBlock::Block(bytes) => bytes,
+            ReadResultGetBlock::ReadError(error) => anyhow::bail!("read error: {error}"),
+        };
+
+        // verify that we still have data for that block (i.e. we read correct data)
+        if self.slot <= state.stored_slots.stored_load() {
+            return self.fetch_upstream(state, upstream_enabled, deadline).await;
+        }
+
+        // parse
+        let block = match generated::ConfirmedBlock::decode(bytes.as_ref()) {
+            Ok(block) => match ConfirmedBlock::try_from(block) {
+                Ok(block) => block,
+                Err(error) => {
+                    error!(self.slot, ?error, "failed to decode block / bincode");
+                    anyhow::bail!("failed to decode block / bincode")
+                }
+            },
+            Err(error) => {
+                error!(self.slot, ?error, "failed to decode block / prost");
+                anyhow::bail!("failed to decode block / prost")
+            }
+        };
+
+        // encode
+        let block = match block.encode_with_options(self.encoding, self.encoding_options) {
+            Ok(block) => block,
+            Err(error) => {
+                return Ok(jsonrpc_response_error(self.id, RpcCustomError::from(error)));
+            }
+        };
+
+        // serialize
+        let data = serde_json::to_value(&block).expect("json serialization never fail");
+
+        RpcRequest::response_success(self.id, data)
+    }
+
+    async fn fetch_upstream(
+        self,
+        state: Arc<State>,
+        upstream_enabled: bool,
+        deadline: Instant,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        if let Some(upstream) = upstream_enabled
+            .then_some(state.upstream.as_ref())
+            .flatten()
+        {
+            upstream
+                .get_block(
+                    deadline,
+                    self.id,
+                    self.slot,
+                    self.commitment,
+                    self.encoding,
+                    self.encoding_options,
+                )
+                .await
+        } else {
+            Self::error_skipped(self.id, self.slot)
+        }
+    }
+
+    fn error_not_available(
         id: Id<'static>,
         slot: Slot,
     ) -> anyhow::Result<Response<'static, serde_json::Value>> {
@@ -463,7 +480,7 @@ impl RpcRequest {
         ))
     }
 
-    fn get_block_error_skipped(
+    fn error_skipped(
         id: Id<'static>,
         slot: Slot,
     ) -> anyhow::Result<Response<'static, serde_json::Value>> {
