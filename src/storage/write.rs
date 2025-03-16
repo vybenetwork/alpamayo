@@ -46,7 +46,7 @@ pub fn start(
     shutdown: Shutdown,
 ) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
     thread::Builder::new()
-        .name("storageWrite".to_owned())
+        .name("alpStorageWrite".to_owned())
         .spawn(move || {
             tokio_uring::start(async move {
                 if let Some(cpus) = config.affinity {

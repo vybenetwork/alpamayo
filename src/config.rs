@@ -212,6 +212,9 @@ pub struct ConfigRpc {
     /// In case of removed data upstream would be used to fetch block
     #[serde(default)]
     pub upstream: Option<ConfigRpcUpstream>,
+    /// Thread pool to parse / encode data
+    #[serde(default)]
+    pub workers: ConfigRpcWorkers,
 }
 
 impl ConfigRpc {
@@ -277,6 +280,30 @@ impl ConfigRpcUpstream {
                 )));
             }
         })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConfigRpcWorkers {
+    /// Number of worker threads
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub threads: usize,
+    /// Threads affinity
+    #[serde(deserialize_with = "deserialize_affinity")]
+    pub affinity: Option<Vec<usize>>,
+    /// Queue size
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub channel_size: usize,
+}
+
+impl Default for ConfigRpcWorkers {
+    fn default() -> Self {
+        Self {
+            threads: num_cpus::get(),
+            affinity: None,
+            channel_size: 4096,
+        }
     }
 }
 

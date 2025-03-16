@@ -1,12 +1,13 @@
 use {
     crate::{
         config::{ConfigRpc, ConfigRpcCall},
-        rpc::upstream::RpcClient,
+        rpc::{upstream::RpcClient, workers::WorkRequest},
         storage::{
             read::{ReadRequest, ReadResultGetBlock},
             slots::StoredSlots,
         },
     },
+    crossbeam::channel::{Sender, TrySendError},
     futures::stream::{FuturesOrdered, StreamExt},
     http_body_util::{BodyExt, Full as BodyFull, Limited, combinators::BoxBody},
     hyper::{
@@ -36,11 +37,16 @@ use {
         sync::Arc,
         time::{Duration, Instant},
     },
-    tokio::sync::{mpsc, oneshot},
+    tokio::{
+        sync::{mpsc, oneshot},
+        time::sleep,
+    },
     tracing::error,
 };
 
 type RpcResponse = hyper::Response<BoxBody<Bytes, std::convert::Infallible>>;
+
+type RpcRequestResult = anyhow::Result<Response<'static, serde_json::Value>>;
 
 fn response_200<D: Into<Bytes>>(data: D) -> HttpResult<RpcResponse> {
     hyper::Response::builder()
@@ -103,6 +109,7 @@ pub struct State {
     supported_calls: SupportedCalls,
     requests_tx: mpsc::Sender<ReadRequest>,
     upstream: Option<RpcClient>,
+    workers: Sender<WorkRequest>,
 }
 
 impl State {
@@ -110,6 +117,7 @@ impl State {
         config: ConfigRpc,
         stored_slots: StoredSlots,
         requests_tx: mpsc::Sender<ReadRequest>,
+        workers: Sender<WorkRequest>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             stored_slots,
@@ -118,6 +126,7 @@ impl State {
             supported_calls: SupportedCalls::new(&config.calls)?,
             requests_tx,
             upstream: config.upstream.map(RpcClient::new).transpose()?,
+            workers,
         })
     }
 
@@ -210,9 +219,7 @@ impl<'a> RpcRequests<'a> {
 
 enum RpcRequest {
     GetBlock(RpcRequestGetBlock),
-    GetSlot {
-        response: anyhow::Result<Response<'static, serde_json::Value>>,
-    },
+    GetSlot { response: RpcRequestResult },
 }
 
 impl RpcRequest {
@@ -327,10 +334,7 @@ impl RpcRequest {
         Ok(())
     }
 
-    fn response_success(
-        id: Id<'static>,
-        payload: serde_json::Value,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+    fn response_success(id: Id<'static>, payload: serde_json::Value) -> RpcRequestResult {
         Ok(Response {
             jsonrpc: Some(TwoPointZero),
             payload: ResponsePayload::success(payload),
@@ -338,14 +342,31 @@ impl RpcRequest {
         })
     }
 
-    async fn process(
-        self,
-        state: Arc<State>,
-        upstream_enabled: bool,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+    async fn process(self, state: Arc<State>, upstream_enabled: bool) -> RpcRequestResult {
         match self {
             Self::GetBlock(request) => request.process(state, upstream_enabled).await,
             Self::GetSlot { response } => response,
+        }
+    }
+
+    async fn process_with_workers(
+        state: Arc<State>,
+        (mut request, rx): (WorkRequest, oneshot::Receiver<RpcRequestResult>),
+    ) -> RpcRequestResult {
+        loop {
+            match state.workers.try_send(request) {
+                Ok(()) => break,
+                Err(TrySendError::Full(value)) => {
+                    request = value;
+                    sleep(Duration::from_micros(100)).await;
+                }
+                Err(TrySendError::Disconnected(_)) => anyhow::bail!("encode workers disconnected"),
+            }
+        }
+
+        match rx.await {
+            Ok(response) => response,
+            Err(_) => anyhow::bail!("failed to get encoded request"),
         }
     }
 }
@@ -359,11 +380,7 @@ struct RpcRequestGetBlock {
 }
 
 impl RpcRequestGetBlock {
-    async fn process(
-        self,
-        state: Arc<State>,
-        upstream_enabled: bool,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+    async fn process(self, state: Arc<State>, upstream_enabled: bool) -> RpcRequestResult {
         let deadline = Instant::now() + state.request_timeout;
 
         // check slot before sending request
@@ -416,8 +433,86 @@ impl RpcRequestGetBlock {
             return self.fetch_upstream(state, upstream_enabled, deadline).await;
         }
 
+        // parse, encode and serialize
+        RpcRequest::process_with_workers(state, RpcRequestGetBlockWorkRequest::create(self, bytes))
+            .await
+    }
+
+    async fn fetch_upstream(
+        self,
+        state: Arc<State>,
+        upstream_enabled: bool,
+        deadline: Instant,
+    ) -> RpcRequestResult {
+        if let Some(upstream) = upstream_enabled
+            .then_some(state.upstream.as_ref())
+            .flatten()
+        {
+            upstream
+                .get_block(
+                    deadline,
+                    self.id,
+                    self.slot,
+                    self.commitment,
+                    self.encoding,
+                    self.encoding_options,
+                )
+                .await
+        } else {
+            Self::error_skipped(self.id, self.slot)
+        }
+    }
+
+    fn error_not_available(id: Id<'static>, slot: Slot) -> RpcRequestResult {
+        Ok(jsonrpc_response_error(
+            id,
+            RpcCustomError::BlockNotAvailable { slot },
+        ))
+    }
+
+    fn error_skipped(id: Id<'static>, slot: Slot) -> RpcRequestResult {
+        Ok(jsonrpc_response_error(
+            id,
+            RpcCustomError::LongTermStorageSlotSkipped { slot },
+        ))
+    }
+}
+
+pub struct RpcRequestGetBlockWorkRequest {
+    bytes: Vec<u8>,
+    id: Id<'static>,
+    slot: Slot,
+    encoding: UiTransactionEncoding,
+    encoding_options: BlockEncodingOptions,
+    tx: Option<oneshot::Sender<RpcRequestResult>>,
+}
+
+impl RpcRequestGetBlockWorkRequest {
+    fn create(
+        request: RpcRequestGetBlock,
+        bytes: Vec<u8>,
+    ) -> (WorkRequest, oneshot::Receiver<RpcRequestResult>) {
+        let (tx, rx) = oneshot::channel();
+        let this = Self {
+            bytes,
+            id: request.id,
+            slot: request.slot,
+            encoding: request.encoding,
+            encoding_options: request.encoding_options,
+            tx: Some(tx),
+        };
+        (WorkRequest::Block(this), rx)
+    }
+
+    pub fn process(mut self) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(self.process2());
+        }
+    }
+
+    fn process2(self) -> RpcRequestResult {
         // parse
-        let block = match generated::ConfirmedBlock::decode(bytes.as_ref()) {
+        let block = match generated::ConfirmedBlock::decode(self.bytes.as_ref()) {
             Ok(block) => match ConfirmedBlock::try_from(block) {
                 Ok(block) => block,
                 Err(error) => {
@@ -443,50 +538,5 @@ impl RpcRequestGetBlock {
         let data = serde_json::to_value(&block).expect("json serialization never fail");
 
         RpcRequest::response_success(self.id, data)
-    }
-
-    async fn fetch_upstream(
-        self,
-        state: Arc<State>,
-        upstream_enabled: bool,
-        deadline: Instant,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
-        if let Some(upstream) = upstream_enabled
-            .then_some(state.upstream.as_ref())
-            .flatten()
-        {
-            upstream
-                .get_block(
-                    deadline,
-                    self.id,
-                    self.slot,
-                    self.commitment,
-                    self.encoding,
-                    self.encoding_options,
-                )
-                .await
-        } else {
-            Self::error_skipped(self.id, self.slot)
-        }
-    }
-
-    fn error_not_available(
-        id: Id<'static>,
-        slot: Slot,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
-        Ok(jsonrpc_response_error(
-            id,
-            RpcCustomError::BlockNotAvailable { slot },
-        ))
-    }
-
-    fn error_skipped(
-        id: Id<'static>,
-        slot: Slot,
-    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
-        Ok(jsonrpc_response_error(
-            id,
-            RpcCustomError::LongTermStorageSlotSkipped { slot },
-        ))
     }
 }

@@ -57,41 +57,38 @@ fn main() -> anyhow::Result<()> {
     let (read_requests_tx, read_requests_rx) = mpsc::channel(config.rpc.request_channel_capacity);
 
     // Create source runtime
-    let source_jh = thread::Builder::new()
-        .name("sourceTokio".to_owned())
-        .spawn({
-            let stream_start = Arc::clone(&stream_start);
-            let shutdown = shutdown.clone();
-            move || {
-                let runtime =
-                    std::mem::take(&mut config.source.tokio).build_runtime("sourceTokioRt")?;
-                runtime.block_on(async move {
-                    let source_fut = tokio::spawn(storage::source::start(
-                        config.source,
-                        rpc_rx,
-                        stream_start,
-                        stream_tx,
-                        shutdown.clone(),
-                    ))
-                    .map_err(Into::into)
-                    .and_then(ready)
-                    .boxed();
+    let source_jh = thread::Builder::new().name("alpSource".to_owned()).spawn({
+        let stream_start = Arc::clone(&stream_start);
+        let shutdown = shutdown.clone();
+        move || {
+            let runtime = std::mem::take(&mut config.source.tokio).build_runtime("alpSourceRt")?;
+            runtime.block_on(async move {
+                let source_fut = tokio::spawn(storage::source::start(
+                    config.source,
+                    rpc_rx,
+                    stream_start,
+                    stream_tx,
+                    shutdown.clone(),
+                ))
+                .map_err(Into::into)
+                .and_then(ready)
+                .boxed();
 
-                    let metrics_fut = if let Some(config) = config.metrics {
-                        metrics::spawn_server(config, shutdown)
-                            .await?
-                            .map_err(anyhow::Error::from)
-                            .boxed()
-                    } else {
-                        ready(Ok(())).boxed()
-                    };
+                let metrics_fut = if let Some(config) = config.metrics {
+                    metrics::spawn_server(config, shutdown)
+                        .await?
+                        .map_err(anyhow::Error::from)
+                        .boxed()
+                } else {
+                    ready(Ok(())).boxed()
+                };
 
-                    try_join_all(vec![source_fut, metrics_fut])
-                        .await
-                        .map(|_| ())
-                })
-            }
-        })?;
+                try_join_all(vec![source_fut, metrics_fut])
+                    .await
+                    .map(|_| ())
+            })
+        }
+    })?;
 
     // Storage runtime
     let storage_write_jh = storage::write::start(
@@ -104,11 +101,11 @@ fn main() -> anyhow::Result<()> {
         shutdown.clone(),
     )?;
 
-    // RPC runtime
-    let rpc_jh = thread::Builder::new().name("rpcTokio".to_owned()).spawn({
+    // Rpc runtime
+    let rpc_jh = thread::Builder::new().name("alpRpc".to_owned()).spawn({
         let shutdown = shutdown.clone();
         move || {
-            let runtime = std::mem::take(&mut config.rpc.tokio).build_runtime("rpcTokioRt")?;
+            let runtime = std::mem::take(&mut config.rpc.tokio).build_runtime("alpRpcRt")?;
             runtime.block_on(async move {
                 rpc::server::spawn(config.rpc, stored_slots, read_requests_tx, shutdown.clone())
                     .await?

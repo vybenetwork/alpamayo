@@ -1,9 +1,10 @@
 use {
     crate::{
         config::ConfigRpc,
-        rpc::api_solana,
+        rpc::{api_solana, workers},
         storage::{read::ReadRequest, slots::StoredSlots},
     },
+    futures::future::{TryFutureExt, ready},
     http_body_util::{BodyExt, Empty as BodyEmpty, Full as BodyFull},
     hyper::{Request, Response, StatusCode, body::Incoming as BodyIncoming, service::service_fn},
     hyper_util::{
@@ -17,17 +18,25 @@ use {
 };
 
 pub async fn spawn(
-    config: ConfigRpc,
+    mut config: ConfigRpc,
     stored_slots: StoredSlots,
     requests_tx: mpsc::Sender<ReadRequest>,
     shutdown: Shutdown,
 ) -> anyhow::Result<impl Future<Output = Result<(), JoinError>>> {
+    let (workers_tx, workers_jhs) =
+        workers::start(std::mem::take(&mut config.workers), shutdown.clone())?;
+
     let listener = TcpListener::bind(config.endpoint).await?;
     info!("start server at: {}", config.endpoint);
 
-    let api_solana_state = Arc::new(api_solana::State::new(config, stored_slots, requests_tx)?);
+    let api_solana_state = Arc::new(api_solana::State::new(
+        config,
+        stored_slots,
+        requests_tx,
+        workers_tx,
+    )?);
 
-    Ok(tokio::spawn(async move {
+    let jh = tokio::spawn(async move {
         let http = ServerBuilder::new(TokioExecutor::new());
         let graceful = hyper_util::server::graceful::GracefulShutdown::new();
 
@@ -82,6 +91,10 @@ pub async fn spawn(
         }
 
         drop(listener);
-        graceful.shutdown().await
-    }))
+        graceful.shutdown().await;
+
+        workers_jhs.await
+    });
+
+    Ok(jh.and_then(ready))
 }
