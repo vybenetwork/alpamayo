@@ -6,7 +6,7 @@ use {
     anyhow::Context,
     bitflags::bitflags,
     solana_sdk::clock::{Slot, UnixTimestamp},
-    std::{collections::HashMap, io, sync::atomic::Ordering},
+    std::{collections::HashMap, io},
     thiserror::Error,
     tokio_uring::fs::File,
 };
@@ -152,10 +152,8 @@ impl StoredBlockHeaders {
             .map_err(|error| anyhow::anyhow!("failed to sync block headers: {error:?}"))?;
 
         // update stored if db was initialized
-        if self.tail == 0 {
-            if let Some(slot) = self.front_slot() {
-                stored_slots.stored.store(slot, Ordering::SeqCst);
-            }
+        if self.tail == 0 && self.head == 0 {
+            stored_slots.stored_store(self.front_slot());
         }
 
         Ok(())
@@ -199,9 +197,7 @@ impl StoredBlockHeaders {
             StoredBlockHeader::new_noexists(),
         );
 
-        stored_slots
-            .stored
-            .store(self.front_slot().unwrap_or(u64::MAX), Ordering::SeqCst);
+        stored_slots.stored_store(self.front_slot());
 
         self.sync(self.tail).await?;
 
@@ -212,12 +208,15 @@ impl StoredBlockHeaders {
 
     pub fn front_slot(&self) -> Option<Slot> {
         let mut index = self.tail;
-        while index != self.head {
+        loop {
             let block = &self.blocks[index];
             if block.exists {
                 return Some(block.slot);
             }
             index = (index + 1) % self.blocks.len();
+            if index == self.head {
+                break;
+            }
         }
         None
     }

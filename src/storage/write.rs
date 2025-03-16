@@ -10,7 +10,7 @@ use {
             blocks::StoredBlockHeaders,
             files::StorageFiles,
             memory::{MemoryConfirmedBlock, MemoryStorage},
-            read::{ReadRequest, ReadRequestPostCheck},
+            read::ReadRequest,
             slots::StoredSlots,
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
         },
@@ -24,7 +24,7 @@ use {
     solana_sdk::clock::Slot,
     std::{
         collections::HashMap,
-        sync::{Arc, atomic::Ordering},
+        sync::Arc,
         thread,
         time::{Duration, Instant},
     },
@@ -33,7 +33,7 @@ use {
         task::{JoinHandle, spawn_local},
         time::sleep,
     },
-    tracing::error,
+    tracing::warn,
 };
 
 pub fn start(
@@ -63,10 +63,7 @@ pub fn start(
                 let mut blocks_files = StorageFiles::open(blocks_files, &blocks_headers).await?;
                 let memory_storage = MemoryStorage::default();
 
-                stored_slots.stored.store(
-                    blocks_headers.front_slot().unwrap_or(u64::MAX),
-                    Ordering::SeqCst,
-                );
+                stored_slots.stored_store(blocks_headers.front_slot());
 
                 let (mut read_requests, result) = start2(
                     stored_slots,
@@ -111,10 +108,7 @@ async fn start2<'a>(
     blocks_files: &mut StorageFiles,
     mut memory_storage: MemoryStorage,
     shutdown: Shutdown,
-) -> (
-    FuturesUnordered<LocalBoxFuture<'a, ReadRequestPostCheck>>,
-    anyhow::Result<()>,
-) {
+) -> (FuturesUnordered<LocalBoxFuture<'a, ()>>, anyhow::Result<()>) {
     let mut read_requests = FuturesUnordered::new();
 
     // get block requests
@@ -143,7 +137,7 @@ async fn start2<'a>(
                         if max_retries == 0 {
                             return Err(error);
                         }
-                        error!(?error, slot, "failed to get confirmed block");
+                        warn!(?error, slot, "failed to get confirmed block");
                         max_retries -= 1;
                         sleep(backoff_wait).await;
                         backoff_wait *= 2;
@@ -265,15 +259,13 @@ async fn start2<'a>(
                     match message {
                         StreamSourceMessage::Block { slot, block } => {
                             memory_storage.add_processed(slot, block);
-                            stored_slots.processed.store(slot, Ordering::SeqCst);
+                            stored_slots.processed_store(slot);
                         }
                         StreamSourceMessage::SlotStatus { slot, status, .. } => {
                             match status {
                                 StreamSourceSlotStatus::Dead => memory_storage.set_dead(slot),
                                 StreamSourceSlotStatus::Confirmed => memory_storage.set_confirmed(slot),
-                                StreamSourceSlotStatus::Finalized =>  {
-                                    stored_slots.finalized.store(slot, Ordering::Relaxed);
-                                }
+                                StreamSourceSlotStatus::Finalized =>  stored_slots.finalized_store(slot),
                             }
                         }
                     }
@@ -318,10 +310,7 @@ async fn start2<'a>(
             },
             // process read request
             message = read_request_fut => match message {
-                Some(result) => {
-                    result.verify(blocks_headers);
-                    continue;
-                },
+                Some(()) => continue,
                 None => unreachable!(),
             },
             // process NEW read request

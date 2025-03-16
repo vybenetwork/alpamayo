@@ -7,7 +7,7 @@ use {
     anyhow::Context,
     futures::future::{FutureExt, LocalBoxFuture, join_all, try_join_all},
     solana_sdk::clock::Slot,
-    std::{collections::HashMap, io, rc::Rc, sync::atomic::Ordering},
+    std::{collections::HashMap, io, rc::Rc},
     tokio::task::yield_now,
     tokio_uring::fs::File,
     tracing::error,
@@ -113,7 +113,7 @@ impl StorageFiles {
 
         let Some(mut block) = block else {
             blocks_headers.push_block_dead(slot, stored_slots).await?;
-            stored_slots.confirmed.store(slot, Ordering::SeqCst);
+            stored_slots.confirmed_store(slot);
             return Ok(());
         };
         let buffer = block.take_buffer();
@@ -143,7 +143,7 @@ impl StorageFiles {
             )
             .await?;
 
-        stored_slots.confirmed.store(slot, Ordering::SeqCst);
+        stored_slots.confirmed_store(slot);
 
         Ok(())
     }

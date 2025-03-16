@@ -34,7 +34,7 @@ impl ReadRequest {
         self,
         blocks_files: &StorageFiles,
         blocks_headers: &StoredBlockHeaders,
-    ) -> Option<LocalBoxFuture<'a, ReadRequestPostCheck>> {
+    ) -> Option<LocalBoxFuture<'a, ()>> {
         match self {
             Self::GetBlock { deadline, slot, tx } => {
                 if deadline < Instant::now() {
@@ -74,55 +74,10 @@ impl ReadRequest {
                         Ok(Err(error)) => ReadResultGetBlock::ReadError(error),
                         Err(_error) => ReadResultGetBlock::Timeout,
                     };
-                    ReadRequestPostCheck::GetBlock { slot, tx, result }
+                    let _ = tx.send(result);
                 }
                 .boxed_local();
                 Some(fut)
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum ReadRequestPostCheck {
-    GetBlock {
-        slot: Slot,
-        tx: oneshot::Sender<ReadResultGetBlock>,
-        result: ReadResultGetBlock,
-    },
-}
-
-impl ReadRequestPostCheck {
-    pub fn verify(self, blocks_headers: &StoredBlockHeaders) {
-        match self {
-            Self::GetBlock {
-                slot,
-                tx,
-                mut result,
-            } => {
-                if matches!(result, ReadResultGetBlock::Block(_)) {
-                    match blocks_headers.get_block_location(slot) {
-                        StorageBlockHeaderLocationResult::Removed => {
-                            result = ReadResultGetBlock::Removed;
-                        }
-                        StorageBlockHeaderLocationResult::Dead => {
-                            result = ReadResultGetBlock::Dead;
-                        }
-                        StorageBlockHeaderLocationResult::NotAvailable => {
-                            result = ReadResultGetBlock::NotAvailable;
-                        }
-                        StorageBlockHeaderLocationResult::SlotMismatch => {
-                            error!(slot, "item/slot mismatch");
-                            result = ReadResultGetBlock::ReadError(io::Error::new(
-                                io::ErrorKind::Other,
-                                "item/slot mismatch",
-                            ));
-                        }
-                        StorageBlockHeaderLocationResult::Found(_location) => {}
-                    };
-                }
-
-                let _ = tx.send(result);
             }
         }
     }

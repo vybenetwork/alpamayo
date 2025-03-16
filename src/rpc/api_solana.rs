@@ -25,7 +25,10 @@ use {
         config::{RpcBlockConfig, RpcEncodingConfigWrapper},
         custom_error::RpcCustomError,
     },
-    solana_sdk::{clock::Slot, commitment_config::CommitmentConfig},
+    solana_sdk::{
+        clock::Slot,
+        commitment_config::{CommitmentConfig, CommitmentLevel},
+    },
     solana_storage_proto::convert::generated,
     solana_transaction_status::{BlockEncodingOptions, ConfirmedBlock, UiTransactionEncoding},
     std::{
@@ -311,6 +314,20 @@ impl RpcRequest {
                 encoding,
                 encoding_options,
             } => {
+                // check slot before sending request
+                let slot_tip = match commitment.commitment {
+                    CommitmentLevel::Processed => unreachable!(),
+                    CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
+                    CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
+                };
+                if slot > slot_tip {
+                    return Self::get_block_error_not_available(id, slot);
+                }
+                if slot <= state.stored_slots.stored_load() {
+                    return Self::get_block_error_skipped(id, slot);
+                }
+
+                // request
                 let (tx, rx) = oneshot::channel();
                 anyhow::ensure!(
                     state
@@ -320,11 +337,9 @@ impl RpcRequest {
                         .is_ok(),
                     "request channel is closed"
                 );
-
                 let Ok(result) = rx.await else {
                     anyhow::bail!("rx channel is closed");
                 };
-
                 let bytes = match result {
                     ReadResultGetBlock::Timeout => anyhow::bail!("timeout"),
                     ReadResultGetBlock::Removed => {
@@ -343,28 +358,25 @@ impl RpcRequest {
                                 )
                                 .await;
                         } else {
-                            return Ok(jsonrpc_response_error(
-                                id,
-                                RpcCustomError::LongTermStorageSlotSkipped { slot },
-                            ));
+                            return Self::get_block_error_skipped(id, slot);
                         }
                     }
                     ReadResultGetBlock::Dead => {
-                        return Ok(jsonrpc_response_error(
-                            id,
-                            RpcCustomError::LongTermStorageSlotSkipped { slot },
-                        ));
+                        return Self::get_block_error_skipped(id, slot);
                     }
                     ReadResultGetBlock::NotAvailable => {
-                        return Ok(jsonrpc_response_error(
-                            id,
-                            RpcCustomError::BlockNotAvailable { slot },
-                        ));
+                        return Self::get_block_error_not_available(id, slot);
                     }
                     ReadResultGetBlock::Block(bytes) => bytes,
                     ReadResultGetBlock::ReadError(error) => anyhow::bail!("read error: {error}"),
                 };
 
+                // verify that we still have data for that block (i.e. we read correct data)
+                if slot <= state.stored_slots.stored_load() {
+                    return Self::get_block_error_skipped(id, slot);
+                }
+
+                // parse
                 let block = match generated::ConfirmedBlock::decode(bytes.as_ref()) {
                     Ok(block) => match ConfirmedBlock::try_from(block) {
                         Ok(block) => match block.encode_with_options(encoding, encoding_options) {
@@ -384,14 +396,35 @@ impl RpcRequest {
                     }
                 };
 
+                // serialize
+                let data = serde_json::to_value(&block).expect("json serialization never fail");
+
                 Ok(Response {
                     jsonrpc: Some(TwoPointZero),
-                    payload: ResponsePayload::success(
-                        serde_json::to_value(&block).expect("json serialization never fail"),
-                    ),
+                    payload: ResponsePayload::success(data),
                     id,
                 })
             }
         }
+    }
+
+    fn get_block_error_not_available(
+        id: Id<'static>,
+        slot: Slot,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        Ok(jsonrpc_response_error(
+            id,
+            RpcCustomError::BlockNotAvailable { slot },
+        ))
+    }
+
+    fn get_block_error_skipped(
+        id: Id<'static>,
+        slot: Slot,
+    ) -> anyhow::Result<Response<'static, serde_json::Value>> {
+        Ok(jsonrpc_response_error(
+            id,
+            RpcCustomError::LongTermStorageSlotSkipped { slot },
+        ))
     }
 }
