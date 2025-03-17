@@ -12,6 +12,8 @@ on:
   push:
     branches:
       - master
+      - agave-v2.1
+      - agave-v2.2
     tags:
       - 'v*'
   workflow_dispatch:
