@@ -1,6 +1,7 @@
 use {
     crate::{
         config::ConfigStorage,
+        metrics,
         source::{
             block::ConfirmedBlockWithBinary,
             rpc::GetBlockError,
@@ -63,7 +64,7 @@ pub fn start(
                     StoredBlocksWrite::open(config.blocks, stored_slots.clone(), sync_tx.clone())
                         .await?;
                 let (mut storage_files, storage_files_read_sync_init) =
-                    StorageFilesWrite::open(files, &blocks, stored_slots.clone()).await?;
+                    StorageFilesWrite::open(files, &blocks).await?;
                 let storage_memory = StorageMemory::default();
 
                 sync_tx
@@ -84,6 +85,7 @@ pub fn start(
                     &mut blocks,
                     &mut storage_files,
                     storage_memory,
+                    sync_tx,
                     shutdown,
                 )
                 .await;
@@ -109,6 +111,7 @@ async fn start2(
     blocks: &mut StoredBlocksWrite,
     storage_files: &mut StorageFilesWrite,
     mut storage_memory: StorageMemory,
+    sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     // get block requests
@@ -199,9 +202,16 @@ async fn start2(
             }
 
             while let Some(block) = queued_slots.remove(&next_database_slot) {
+                let _ = sync_tx.send(ReadWriteSyncMessage::BlockConfirmed {
+                    slot: next_database_slot,
+                    block: block.clone(),
+                });
+
+                let timer = metrics::storage_block_sync_start_timer();
                 storage_files
                     .push_block(next_database_slot, block, blocks)
                     .await?;
+                timer.observe_duration();
 
                 next_database_slot += 1;
             }
@@ -238,14 +248,18 @@ async fn start2(
                     // add message
                     match message {
                         StreamSourceMessage::Block { slot, block } => {
-                            storage_memory.add_processed(slot, block);
+                            storage_memory.add_processed(slot, block.clone());
+                            let _ = sync_tx.send(ReadWriteSyncMessage::BlockNew { slot, block });
                             stored_slots.processed_store(slot);
                         }
                         StreamSourceMessage::SlotStatus { slot, status, .. } => {
                             match status {
-                                StreamSourceSlotStatus::Dead => storage_memory.set_dead(slot),
+                                StreamSourceSlotStatus::Dead => {
+                                    storage_memory.set_dead(slot);
+                                    let _ = sync_tx.send(ReadWriteSyncMessage::BlockDead { slot });
+                                },
                                 StreamSourceSlotStatus::Confirmed => storage_memory.set_confirmed(slot),
-                                StreamSourceSlotStatus::Finalized =>  stored_slots.finalized_store(slot),
+                                StreamSourceSlotStatus::Finalized => stored_slots.finalized_store(slot),
                             }
                         }
                     }
@@ -293,9 +307,16 @@ async fn start2(
 
         // save blocks
         while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
+            let _ = sync_tx.send(ReadWriteSyncMessage::BlockConfirmed {
+                slot: next_confirmed_slot,
+                block: block.clone(),
+            });
+
+            let timer = metrics::storage_block_sync_start_timer();
             storage_files
                 .push_block(next_confirmed_slot, block, blocks)
                 .await?;
+            timer.observe_duration();
 
             next_confirmed_slot += 1;
         }
