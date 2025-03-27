@@ -119,6 +119,8 @@ pub enum ConfigSourceStreamKind {
 pub struct ConfigStorage {
     /// Storage files for blocks
     pub blocks: ConfigStorageBlocks,
+    /// Indices storage (RocksDB)
+    pub rocksdb: ConfigStorageRocksdb,
     /// Write thread config
     #[serde(default)]
     pub write: ConfigStorageWrite,
@@ -172,6 +174,32 @@ pub struct ConfigStorageFile {
     pub path: PathBuf,
     #[serde(deserialize_with = "deserialize_humansize")]
     pub size: u64,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigStorageRocksdb {
+    pub path: PathBuf,
+    #[serde(
+        default = "ConfigStorageRocksdb::default_read_channel_size",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub read_channel_size: usize,
+    #[serde(
+        default = "ConfigStorageRocksdb::default_read_workers",
+        deserialize_with = "deserialize_num_str"
+    )]
+    pub read_workers: usize,
+}
+
+impl ConfigStorageRocksdb {
+    fn default_read_channel_size() -> usize {
+        num_cpus::get() * 5
+    }
+
+    fn default_read_workers() -> usize {
+        num_cpus::get()
+    }
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -259,6 +287,7 @@ impl ConfigRpc {
 pub enum ConfigRpcCall {
     GetBlock,
     GetSlot,
+    GetTransaction,
 }
 
 #[derive(Debug, Clone, Deserialize)]

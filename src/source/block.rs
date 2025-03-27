@@ -1,4 +1,5 @@
 use {
+    crate::source::transaction::TransactionWithBinary,
     prost::{
         DecodeError, Message,
         bytes::{Buf, BufMut},
@@ -6,60 +7,68 @@ use {
             self, DecodeContext, WireType, encode_key, encode_varint, encoded_len_varint, key_len,
         },
     },
-    solana_sdk::clock::{Slot, UnixTimestamp},
+    solana_sdk::{
+        clock::{Slot, UnixTimestamp},
+        signature::Signature,
+    },
     solana_storage_proto::convert::generated,
-    solana_transaction_status::{ConfirmedBlock, Reward, RewardType},
-    std::{ops::Deref, sync::Arc},
+    solana_transaction_status::{Reward, RewardType, Rewards},
+    std::{collections::HashMap, ops::Deref},
 };
 
-#[derive(Debug, Clone)]
-pub struct ConfirmedBlockWithBinary {
-    pub parent_slot: Slot,
-    pub block_time: Option<UnixTimestamp>,
-    protobuf: Arc<Vec<u8>>,
+#[derive(Debug, Clone, Copy)]
+pub struct BlockTransactionOffset {
+    pub hash: [u8; 8],
+    pub offset: u64,
+    pub size: u64,
 }
 
-impl ConfirmedBlockWithBinary {
-    pub fn new(block: ConfirmedBlock, transactions_proto: Option<Vec<Vec<u8>>>) -> Self {
-        let transactions_proto = transactions_proto.unwrap_or_else(|| {
-            block
-                .transactions
-                .iter()
-                .cloned()
-                .map(|tx| generated::ConfirmedTransaction::from(tx).encode_to_vec())
-                .collect()
-        });
+#[derive(Debug)]
+pub struct BlockWithBinary {
+    pub parent_slot: Slot,
+    pub block_time: Option<UnixTimestamp>,
+    pub protobuf: Vec<u8>,
+    pub txs_offset: Vec<BlockTransactionOffset>,
+    pub transactions: HashMap<Signature, TransactionWithBinary>,
+}
 
-        let parent_slot = block.parent_slot;
-        let block_time = block.block_time;
-
-        let buffer = ConfirmedBlockProtoRef {
-            previous_blockhash: &block.previous_blockhash,
-            blockhash: &block.blockhash,
-            parent_slot: block.parent_slot,
-            transactions: &transactions_proto,
-            rewards: &block.rewards,
-            block_time: block
-                .block_time
-                .map(|timestamp| generated::UnixTimestamp { timestamp }),
-            block_height: block
-                .block_height
-                .map(|block_height| generated::BlockHeight { block_height }),
-            num_partitions: block
-                .num_partitions
+impl BlockWithBinary {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        previous_blockhash: String,
+        blockhash: String,
+        parent_slot: Slot,
+        transactions: Vec<TransactionWithBinary>,
+        rewards: Rewards,
+        num_partitions: Option<u64>,
+        block_time: Option<UnixTimestamp>,
+        block_height: Option<u64>,
+    ) -> Self {
+        let (protobuf, txs_offset) = ConfirmedBlockProtoRef {
+            previous_blockhash: &previous_blockhash,
+            blockhash: &blockhash,
+            parent_slot,
+            transactions: &transactions,
+            rewards: &rewards,
+            block_time: block_time.map(|timestamp| generated::UnixTimestamp { timestamp }),
+            block_height: block_height.map(|block_height| generated::BlockHeight { block_height }),
+            num_partitions: num_partitions
                 .map(|num_partitions| generated::NumPartitions { num_partitions }),
         }
-        .encode_to_vec();
+        .encode_with_tx_offsets();
+
+        let transactions = transactions
+            .into_iter()
+            .map(|tx| (tx.signature, tx))
+            .collect();
 
         Self {
             parent_slot,
             block_time,
-            protobuf: Arc::new(buffer),
+            protobuf,
+            txs_offset,
+            transactions,
         }
-    }
-
-    pub fn get_protobuf(&self) -> Vec<u8> {
-        self.protobuf.as_ref().clone()
     }
 }
 
@@ -68,45 +77,52 @@ struct ConfirmedBlockProtoRef<'a> {
     previous_blockhash: &'a String,
     blockhash: &'a String,
     parent_slot: Slot,
-    transactions: &'a [Vec<u8>],
+    transactions: &'a [TransactionWithBinary],
     rewards: &'a [Reward],
     block_time: Option<generated::UnixTimestamp>,
     block_height: Option<generated::BlockHeight>,
     num_partitions: Option<generated::NumPartitions>,
 }
 
-impl Message for ConfirmedBlockProtoRef<'_> {
-    fn encode_raw<B>(&self, buf: &mut B)
-    where
-        B: BufMut,
-        Self: Sized,
-    {
+impl ConfirmedBlockProtoRef<'_> {
+    fn encode_with_tx_offsets(&self) -> (Vec<u8>, Vec<BlockTransactionOffset>) {
+        let mut buf = Vec::with_capacity(self.encoded_len());
+
         if !self.previous_blockhash.is_empty() {
-            bytes_encode(1, self.previous_blockhash.as_ref(), buf);
+            bytes_encode(1, self.previous_blockhash.as_ref(), &mut buf);
         }
         if !self.blockhash.is_empty() {
-            bytes_encode(2, self.blockhash.as_ref(), buf);
+            bytes_encode(2, self.blockhash.as_ref(), &mut buf);
         }
         if self.parent_slot != 0 {
-            encoding::uint64::encode(3, &self.parent_slot, buf);
+            encoding::uint64::encode(3, &self.parent_slot, &mut buf);
         }
-        for tx in self.transactions {
-            encode_key(4, WireType::LengthDelimited, buf);
-            encode_varint(tx.len() as u64, buf);
-            buf.put_slice(tx);
+        let mut offsets = Vec::with_capacity(self.transactions.len());
+        for tx in self.transactions.iter() {
+            encode_key(4, WireType::LengthDelimited, &mut buf);
+            encode_varint(tx.protobuf.len() as u64, &mut buf);
+            let offset = buf.len() as u64;
+            buf.put_slice(&tx.protobuf);
+            offsets.push(BlockTransactionOffset {
+                hash: tx.hash,
+                offset,
+                size: tx.protobuf.len() as u64,
+            });
         }
         for reward in self.rewards {
-            encoding::message::encode(5, &RewardWrapper(reward), buf);
+            encoding::message::encode(5, &RewardWrapper(reward), &mut buf);
         }
         if let Some(block_time) = &self.block_time {
-            encoding::message::encode(6, block_time, buf);
+            encoding::message::encode(6, block_time, &mut buf);
         }
         if let Some(block_height) = &self.block_height {
-            encoding::message::encode(7, block_height, buf);
+            encoding::message::encode(7, block_height, &mut buf);
         }
         if let Some(num_partitions) = &self.num_partitions {
-            encoding::message::encode(8, num_partitions, buf);
+            encoding::message::encode(8, num_partitions, &mut buf);
         }
+
+        (buf, offsets)
     }
 
     fn encoded_len(&self) -> usize {
@@ -126,7 +142,7 @@ impl Message for ConfirmedBlockProtoRef<'_> {
             + self
                 .transactions
                 .iter()
-                .map(|slice| slice.len())
+                .map(|tx| tx.protobuf.len())
                 .map(|len| len + encoded_len_varint(len as u64))
                 .sum::<usize>())
             + (key_len(5u32) * self.rewards.len()
@@ -151,24 +167,6 @@ impl Message for ConfirmedBlockProtoRef<'_> {
             } else {
                 0
             }
-    }
-
-    fn clear(&mut self) {
-        unimplemented!()
-    }
-
-    fn merge_field<B>(
-        &mut self,
-        _tag: u32,
-        _wire_type: WireType,
-        _buf: &mut B,
-        _ctx: DecodeContext,
-    ) -> Result<(), DecodeError>
-    where
-        B: Buf,
-        Self: Sized,
-    {
-        unimplemented!()
     }
 }
 

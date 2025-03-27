@@ -3,7 +3,7 @@ use {
         config::ConfigStorage,
         metrics,
         source::{
-            block::ConfirmedBlockWithBinary,
+            block::BlockWithBinary,
             rpc::GetBlockError,
             stream::{StreamSourceMessage, StreamSourceSlotStatus},
         },
@@ -11,6 +11,7 @@ use {
             blocks::StoredBlocksWrite,
             files::StorageFilesWrite,
             memory::{MemoryConfirmedBlock, StorageMemory},
+            rocksdb::Rocksdb,
             slots::StoredSlots,
             source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
             sync::ReadWriteSyncMessage,
@@ -37,9 +38,11 @@ use {
     tracing::warn,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub fn start(
-    mut config: ConfigStorage,
+    config: ConfigStorage,
     stored_slots: StoredSlots,
+    storage_indices: Rocksdb,
     rpc_tx: mpsc::Sender<RpcRequest>,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
@@ -59,7 +62,7 @@ pub fn start(
                 let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
                 let rpc = RpcSourceConnected::new(rpc_tx);
 
-                let files = std::mem::take(&mut config.blocks.files);
+                let files = config.blocks.files.clone();
                 let (mut blocks, blocks_read_sync_init) =
                     StoredBlocksWrite::open(config.blocks, stored_slots.clone(), sync_tx.clone())
                         .await?;
@@ -70,6 +73,7 @@ pub fn start(
                 sync_tx
                     .send(ReadWriteSyncMessage::Init {
                         blocks: blocks_read_sync_init,
+                        storage_indices: storage_indices.clone(),
                         storage_files_init: storage_files_read_sync_init,
                     })
                     .context("failed to send read/write init message")?;
@@ -85,6 +89,7 @@ pub fn start(
                     &mut blocks,
                     &mut storage_files,
                     storage_memory,
+                    storage_indices,
                     sync_tx,
                     shutdown,
                 )
@@ -111,6 +116,7 @@ async fn start2(
     blocks: &mut StoredBlocksWrite,
     storage_files: &mut StorageFilesWrite,
     mut storage_memory: StorageMemory,
+    storage_indices: Rocksdb,
     sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
@@ -118,9 +124,7 @@ async fn start2(
     let mut rpc_requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
     let get_confirmed_block = |rpc_requests: &mut FuturesUnordered<
-        JoinHandle<
-            Result<(u64, Option<ConfirmedBlockWithBinary>), RpcSourceConnectedError<GetBlockError>>,
-        >,
+        JoinHandle<Result<(u64, Option<BlockWithBinary>), RpcSourceConnectedError<GetBlockError>>>,
     >,
                                slot: Slot| {
         let mut max_retries = rpc_getblock_max_retries;
@@ -151,7 +155,7 @@ async fn start2(
     };
 
     // queue of confirmed blocks
-    let mut queued_slots = HashMap::<Slot, Option<ConfirmedBlockWithBinary>>::new();
+    let mut queued_slots = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::new();
     let mut queued_slots_backfilled = false;
 
     // fill the gap between stored and new
@@ -190,7 +194,7 @@ async fn start2(
             // push block into the queue
             match rpc_requests.next().await {
                 Some(Ok(Ok((slot, block)))) => {
-                    queued_slots.insert(slot, block);
+                    queued_slots.insert(slot, block.map(Arc::new));
                 }
                 Some(Ok(Err(error))) => {
                     return Err(error).context("failed to get confirmed block");
@@ -208,8 +212,8 @@ async fn start2(
                 });
 
                 let timer = metrics::storage_block_sync_start_timer();
-                storage_files
-                    .push_block(next_database_slot, block, blocks)
+                blocks
+                    .push_block(next_database_slot, block, storage_files, &storage_indices)
                     .await?;
                 timer.observe_duration();
 
@@ -232,7 +236,7 @@ async fn start2(
             // insert block requested from rpc
             message = rpc_requests_next => match message {
                 Some(Ok(Ok((slot, block)))) => {
-                    queued_slots.insert(slot, block);
+                    queued_slots.insert(slot, block.map(Arc::new));
                 },
                 Some(Ok(Err(error))) => {
                     return Err(error).context("failed to get confirmed block");
@@ -248,7 +252,8 @@ async fn start2(
                     // add message
                     match message {
                         StreamSourceMessage::Block { slot, block } => {
-                            storage_memory.add_processed(slot, block.clone());
+                            let block = Arc::new(block);
+                            storage_memory.add_processed(slot, Arc::clone(&block));
                             let _ = sync_tx.send(ReadWriteSyncMessage::BlockNew { slot, block });
                             stored_slots.processed_store(slot);
                         }
@@ -313,8 +318,8 @@ async fn start2(
             });
 
             let timer = metrics::storage_block_sync_start_timer();
-            storage_files
-                .push_block(next_confirmed_slot, block, blocks)
+            blocks
+                .push_block(next_confirmed_slot, block, storage_files, &storage_indices)
                 .await?;
             timer.observe_duration();
 
