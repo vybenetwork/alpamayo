@@ -60,8 +60,9 @@ fn main() -> anyhow::Result<()> {
     let stored_slots = storage::slots::StoredSlots::default();
     let (read_requests_tx, read_requests_rx) = mpsc::channel(config.rpc.request_channel_capacity);
 
-    // Open Rocksdb for indices
-    let (db, db_threads) = storage::rocksdb::Rocksdb::open(config.storage.rocksdb.clone())?;
+    // Open Rocksdb for slots and indexes
+    let (db_write, db_read, db_threads) =
+        storage::rocksdb::Rocksdb::open(config.storage.rocksdb.clone(), sync_tx.clone())?;
     threads.extend(db_threads);
 
     // Create source runtime
@@ -132,7 +133,8 @@ fn main() -> anyhow::Result<()> {
     let jh = storage::write::start(
         config.storage.clone(),
         stored_slots.clone(),
-        db,
+        db_write,
+        db_read,
         rpc_tx,
         stream_start,
         stream_rx,

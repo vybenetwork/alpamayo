@@ -4,7 +4,7 @@ use {
         storage::{
             blocks::{StorageBlockLocationResult, StoredBlocksRead},
             files::StorageFilesRead,
-            rocksdb::{Rocksdb, TransactionIndexValue},
+            rocksdb::{RocksdbRead, TransactionIndexValue},
             slots::StoredConfirmedSlot,
             sync::ReadWriteSyncMessage,
         },
@@ -48,16 +48,16 @@ pub fn start(
                     affinity::set_thread_affinity(&cpus).expect("failed to set affinity")
                 }
 
-                let (mut blocks, storage_indices, storage_files) = match sync_rx.recv().await {
+                let (mut blocks, db_read, storage_files) = match sync_rx.recv().await {
                     Ok(ReadWriteSyncMessage::Init {
                         blocks,
-                        storage_indices,
+                        db_read,
                         storage_files_init,
                     }) => {
                         let storage_files = StorageFilesRead::open(storage_files_init)
                             .await
                             .context("failed to open storage files")?;
-                        (blocks, storage_indices, storage_files)
+                        (blocks, db_read, storage_files)
                     }
                     Ok(_) => anyhow::bail!("invalid sync message"),
                     Err(broadcast::error::RecvError::Closed) => return Ok(()), // shutdown
@@ -72,7 +72,7 @@ pub fn start(
                     index,
                     sync_rx,
                     &mut blocks,
-                    &storage_indices,
+                    &db_read,
                     &storage_files,
                     &mut confirmed_in_process,
                     read_requests_concurrency,
@@ -87,7 +87,7 @@ pub fn start(
                         Some(Some(request)) => {
                             if let Some(future) = request.process(
                                 &blocks,
-                                &storage_indices,
+                                &db_read,
                                 &storage_files,
                                 &confirmed_in_process,
                                 None,
@@ -111,7 +111,7 @@ async fn start2(
     index: usize,
     mut sync_rx: broadcast::Receiver<ReadWriteSyncMessage>,
     blocks: &mut StoredBlocksRead,
-    storage_indices: &Rocksdb,
+    db_read: &RocksdbRead,
     storage_files: &StorageFilesRead,
     confirmed_in_process: &mut Option<(Slot, Option<Arc<BlockWithBinary>>)>,
     read_requests_concurrency: Arc<Semaphore>,
@@ -158,7 +158,7 @@ async fn start2(
             // existed request
             message = read_request_fut => match message {
                 Some(Some(request)) => {
-                    if let Some(future) = request.process(blocks, storage_indices, storage_files, confirmed_in_process, None) {
+                    if let Some(future) = request.process(blocks, db_read, storage_files, confirmed_in_process, None) {
                         read_requests.push(future);
                     }
                 }
@@ -175,7 +175,7 @@ async fn start2(
                     return Ok(());
                 };
 
-                if let Some(future) = request.process(blocks, storage_indices, storage_files, confirmed_in_process, Some(lock)) {
+                if let Some(future) = request.process(blocks, db_read, storage_files, confirmed_in_process, Some(lock)) {
                     read_requests.push(future);
                 }
             },
@@ -277,7 +277,7 @@ impl ReadRequest {
     pub fn process<'a>(
         self,
         blocks: &StoredBlocksRead,
-        storage_indices: &Rocksdb,
+        db_read: &RocksdbRead,
         storage_files: &StorageFilesRead,
         confirmed_in_process: &Option<(Slot, Option<Arc<BlockWithBinary>>)>,
         lock: Option<OwnedSemaphorePermit>,
@@ -360,7 +360,7 @@ impl ReadRequest {
                     }
                 }
 
-                let read_tx_index = match storage_indices.read_tx_index(signature) {
+                let read_tx_index = match db_read.read_tx_index(signature) {
                     Ok(fut) => fut,
                     Err(error) => {
                         let _ = tx.send(ReadResultGetTransaction::ReadError(error));

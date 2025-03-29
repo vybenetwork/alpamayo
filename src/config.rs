@@ -119,7 +119,7 @@ pub enum ConfigSourceStreamKind {
 pub struct ConfigStorage {
     /// Storage files for blocks
     pub blocks: ConfigStorageBlocks,
-    /// Indices storage (RocksDB)
+    /// Storage of slots and tx index (RocksDB)
     pub rocksdb: ConfigStorageRocksdb,
     /// Write thread config
     #[serde(default)]
@@ -134,7 +134,6 @@ pub struct ConfigStorage {
 pub struct ConfigStorageBlocks {
     #[serde(deserialize_with = "deserialize_num_str")]
     pub max: usize,
-    pub path: PathBuf,
     #[serde(
         default = "ConfigStorageBlocks::default_rpc_getblock_max_retries",
         deserialize_with = "deserialize_num_str"

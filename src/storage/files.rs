@@ -2,7 +2,7 @@ use {
     crate::{
         config::ConfigStorageFile,
         storage::{
-            blocks::{StorageBlockLocation, StoredBlocksWrite},
+            blocks::{StoredBlock, StoredBlocksWrite},
             util,
         },
     },
@@ -12,7 +12,7 @@ use {
     tokio_uring::fs::File,
 };
 
-pub type StorageId = u32;
+pub type StorageId = u8;
 
 #[derive(Debug)]
 pub struct StorageFilesRead {
@@ -168,7 +168,7 @@ impl StorageFilesWrite {
         Ok((buffer, Some((file.id, offset))))
     }
 
-    pub fn pop_block(&mut self, block: StorageBlockLocation) -> anyhow::Result<()> {
+    pub fn pop_block(&mut self, block: StoredBlock) -> anyhow::Result<()> {
         let Some(file_index) = self.id2file.get(&block.storage_id).copied() else {
             anyhow::bail!("unknown storage id: {}", block.storage_id);
         };
