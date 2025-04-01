@@ -1,5 +1,5 @@
 use {
-    crate::source::transaction::TransactionWithBinary,
+    crate::source::{sfa::SignaturesForAddress, transaction::TransactionWithBinary},
     prost::{
         DecodeError, Message,
         bytes::{Buf, BufMut},
@@ -9,16 +9,20 @@ use {
     },
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
+        pubkey::Pubkey,
         signature::Signature,
     },
     solana_storage_proto::convert::generated,
     solana_transaction_status::{Reward, RewardType, Rewards},
-    std::{collections::HashMap, ops::Deref},
+    std::{
+        collections::{HashMap, hash_map::Entry as HashMapEntry},
+        ops::Deref,
+    },
 };
 
 #[derive(Debug, Clone, Copy)]
 pub struct BlockTransactionOffset {
-    pub hash: [u8; 8],
+    pub key: [u8; 8],
     pub offset: u64,
     pub size: u64,
 }
@@ -31,6 +35,7 @@ pub struct BlockWithBinary {
     pub protobuf: Vec<u8>,
     pub txs_offset: Vec<BlockTransactionOffset>,
     pub transactions: HashMap<Signature, TransactionWithBinary>,
+    pub sfa: HashMap<Pubkey, SignaturesForAddress>,
 }
 
 impl BlockWithBinary {
@@ -39,7 +44,7 @@ impl BlockWithBinary {
         previous_blockhash: String,
         blockhash: String,
         parent_slot: Slot,
-        transactions: Vec<TransactionWithBinary>,
+        mut transactions: Vec<TransactionWithBinary>,
         rewards: Rewards,
         num_partitions: Option<u64>,
         block_time: Option<UnixTimestamp>,
@@ -58,6 +63,20 @@ impl BlockWithBinary {
         }
         .encode_with_tx_offsets();
 
+        let mut sfa = HashMap::<Pubkey, SignaturesForAddress>::new();
+        for tx in transactions.iter_mut().rev() {
+            for tx_sfa in tx.sfa.drain(..) {
+                match sfa.entry(tx_sfa.address) {
+                    HashMapEntry::Occupied(mut entry) => {
+                        entry.get_mut().merge(tx_sfa);
+                    }
+                    HashMapEntry::Vacant(entry) => {
+                        entry.insert(SignaturesForAddress::new(tx_sfa));
+                    }
+                }
+            }
+        }
+
         let transactions = transactions
             .into_iter()
             .map(|tx| (tx.signature, tx))
@@ -70,6 +89,7 @@ impl BlockWithBinary {
             protobuf,
             txs_offset,
             transactions,
+            sfa,
         }
     }
 }
@@ -106,7 +126,7 @@ impl ConfirmedBlockProtoRef<'_> {
             let offset = buf.len() as u64;
             buf.put_slice(&tx.protobuf);
             offsets.push(BlockTransactionOffset {
-                hash: tx.hash,
+                key: tx.key,
                 offset,
                 size: tx.protobuf.len() as u64,
             });

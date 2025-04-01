@@ -3,10 +3,14 @@ use {
         config::{ConfigRpc, ConfigRpcCall},
         rpc::{upstream::RpcClient, workers::WorkRequest},
         storage::{
-            read::{ReadRequest, ReadResultBlock, ReadResultBlockHeight, ReadResultTransaction},
+            read::{
+                ReadRequest, ReadResultBlock, ReadResultBlockHeight,
+                ReadResultSignaturesForAddress, ReadResultTransaction,
+            },
             slots::StoredSlots,
         },
     },
+    anyhow::Context,
     crossbeam::channel::{Sender, TrySendError},
     futures::stream::{FuturesOrdered, StreamExt},
     http_body_util::{BodyExt, Full as BodyFull, Limited, combinators::BoxBody},
@@ -24,13 +28,17 @@ use {
     serde::{Deserialize, de},
     solana_rpc_client_api::{
         config::{
-            RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper, RpcTransactionConfig,
+            RpcBlockConfig, RpcContextConfig, RpcEncodingConfigWrapper,
+            RpcSignaturesForAddressConfig, RpcTransactionConfig,
         },
         custom_error::RpcCustomError,
+        request::MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT,
+        response::RpcConfirmedTransactionStatusWithSignature,
     },
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
         commitment_config::{CommitmentConfig, CommitmentLevel},
+        pubkey::Pubkey,
         signature::Signature,
     },
     solana_storage_proto::convert::generated,
@@ -92,6 +100,7 @@ fn jsonrpc_response_error(
 struct SupportedCalls {
     get_block: bool,
     get_block_height: bool,
+    get_signatures_for_address: bool,
     get_slot: bool,
     get_transaction: bool,
 }
@@ -101,6 +110,10 @@ impl SupportedCalls {
         Ok(Self {
             get_block: Self::check_call_support(calls, ConfigRpcCall::GetBlock)?,
             get_block_height: Self::check_call_support(calls, ConfigRpcCall::GetBlockHeight)?,
+            get_signatures_for_address: Self::check_call_support(
+                calls,
+                ConfigRpcCall::GetSignaturesForAddress,
+            )?,
             get_slot: Self::check_call_support(calls, ConfigRpcCall::GetSlot)?,
             get_transaction: Self::check_call_support(calls, ConfigRpcCall::GetTransaction)?,
         })
@@ -232,6 +245,7 @@ impl<'a> RpcRequests<'a> {
 enum RpcRequest {
     Block(RpcRequestBlock),
     BlockHeight(RpcRequestBlockHeight),
+    SignaturesForAddress(RpcRequestSignaturesForAddress),
     Transaction(RpcRequestTransaction),
 }
 
@@ -286,8 +300,8 @@ impl RpcRequest {
                     min_context_slot,
                 } = config.unwrap_or_default();
 
-                let commitment = commitment.unwrap_or_default().commitment;
-                let slot = match commitment {
+                let commitment = commitment.unwrap_or_default();
+                let slot = match commitment.commitment {
                     CommitmentLevel::Processed => state.stored_slots.processed_load(),
                     CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
                     CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
@@ -305,6 +319,59 @@ impl RpcRequest {
                 Ok(Self::BlockHeight(RpcRequestBlockHeight {
                     id: id.into_owned(),
                     commitment,
+                }))
+            }
+            "getSignaturesForAddress" if state.supported_calls.get_signatures_for_address => {
+                #[derive(Debug, Deserialize)]
+                struct ReqParams {
+                    address: String,
+                    #[serde(default)]
+                    config: Option<RpcSignaturesForAddressConfig>,
+                }
+
+                let (id, ReqParams { address, config }) = Self::parse_params(request)?;
+                let RpcSignaturesForAddressConfig {
+                    before,
+                    until,
+                    limit,
+                    commitment,
+                    min_context_slot,
+                } = config.unwrap_or_default();
+
+                let (address, before, until, limit) =
+                    match Self::verify_and_parse_signatures_for_address_params(
+                        address, before, until, limit,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => return Err(Self::response_error(id, error)),
+                    };
+
+                let commitment = commitment.unwrap_or_default();
+                if let Err(error) = Self::check_is_at_least_confirmed(commitment) {
+                    return Err(Self::response_error(id, error));
+                }
+
+                if let Some(min_context_slot) = min_context_slot {
+                    let slot = match commitment.commitment {
+                        CommitmentLevel::Processed => unreachable!(),
+                        CommitmentLevel::Confirmed => state.stored_slots.confirmed_load(),
+                        CommitmentLevel::Finalized => state.stored_slots.finalized_load(),
+                    };
+                    if slot < min_context_slot {
+                        return Err(jsonrpc_response_error(
+                            id.into_owned(),
+                            RpcCustomError::MinContextSlotNotReached { context_slot: slot },
+                        ));
+                    }
+                }
+
+                Ok(Self::SignaturesForAddress(RpcRequestSignaturesForAddress {
+                    id: id.into_owned(),
+                    commitment,
+                    address,
+                    before,
+                    until,
+                    limit,
                 }))
             }
             "getSlot" if state.supported_calls.get_slot => {
@@ -422,6 +489,42 @@ impl RpcRequest {
         })
     }
 
+    fn verify_pubkey(input: &str) -> Result<Pubkey, ErrorObjectOwned> {
+        input.parse().map_err(|error| {
+            ErrorObject::owned::<()>(
+                ErrorCode::InvalidParams.code(),
+                format!("Invalid param: {error:?}"),
+                None,
+            )
+        })
+    }
+
+    fn verify_and_parse_signatures_for_address_params(
+        address: String,
+        before: Option<String>,
+        until: Option<String>,
+        limit: Option<usize>,
+    ) -> Result<(Pubkey, Option<Signature>, Option<Signature>, usize), ErrorObjectOwned> {
+        let address = Self::verify_pubkey(&address)?;
+        let before = before
+            .map(|ref before| Self::verify_signature(before))
+            .transpose()?;
+        let until = until
+            .map(|ref until| Self::verify_signature(until))
+            .transpose()?;
+        let limit = limit.unwrap_or(MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT);
+
+        if limit == 0 || limit > MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT {
+            Err(ErrorObject::owned::<()>(
+                ErrorCode::InvalidParams.code(),
+                format!("Invalid limit; max {MAX_GET_CONFIRMED_SIGNATURES_FOR_ADDRESS2_LIMIT}"),
+                None,
+            ))
+        } else {
+            Ok((address, before, until, limit))
+        }
+    }
+
     fn response_error(id: Id<'_>, error: ErrorObjectOwned) -> Response<'_, serde_json::Value> {
         Response {
             jsonrpc: Some(TwoPointZero),
@@ -442,6 +545,7 @@ impl RpcRequest {
         match self {
             Self::Block(request) => request.process(state, upstream_disabled).await,
             Self::BlockHeight(request) => request.process(state).await,
+            Self::SignaturesForAddress(request) => request.process(state, upstream_disabled).await,
             Self::Transaction(request) => request.process(state, upstream_disabled).await,
         }
     }
@@ -650,7 +754,7 @@ impl RpcRequestBlockWorkRequest {
 
 struct RpcRequestBlockHeight {
     id: Id<'static>,
-    commitment: CommitmentLevel,
+    commitment: CommitmentConfig,
 }
 
 impl RpcRequestBlockHeight {
@@ -683,6 +787,119 @@ impl RpcRequestBlockHeight {
             self.id,
             serde_json::json!(block_height),
         ))
+    }
+}
+
+#[derive(Debug)]
+struct RpcRequestSignaturesForAddress {
+    id: Id<'static>,
+    commitment: CommitmentConfig,
+    address: Pubkey,
+    before: Option<Signature>,
+    until: Option<Signature>,
+    limit: usize,
+}
+
+impl RpcRequestSignaturesForAddress {
+    async fn process(self, state: Arc<State>, upstream_disabled: bool) -> RpcRequestResult {
+        let deadline = Instant::now() + state.request_timeout;
+
+        // request
+        let (tx, rx) = oneshot::channel();
+        anyhow::ensure!(
+            state
+                .requests_tx
+                .send(ReadRequest::SignaturesForAddress {
+                    deadline,
+                    commitment: self.commitment,
+                    address: self.address,
+                    before: self.before,
+                    until: self.until,
+                    limit: self.limit,
+                    tx,
+                })
+                .await
+                .is_ok(),
+            "request channel is closed"
+        );
+        let Ok(result) = rx.await else {
+            anyhow::bail!("rx channel is closed");
+        };
+        let (mut signatures, finished, mut before) = match result {
+            ReadResultSignaturesForAddress::Timeout => anyhow::bail!("timeout"),
+            ReadResultSignaturesForAddress::Signatures {
+                signatures,
+                finished,
+                before,
+            } => (signatures, finished, before),
+            ReadResultSignaturesForAddress::ReadError(error) => {
+                anyhow::bail!("read error: {error}")
+            }
+        };
+
+        let limit = self.limit - signatures.len();
+        if !finished && !upstream_disabled && limit > 0 {
+            if !signatures.is_empty() {
+                before = signatures
+                    .last()
+                    .map(|sig| sig.signature.parse().expect("valid sig"));
+            }
+
+            match self
+                .fetch_upstream(state, upstream_disabled, deadline, before, limit)
+                .await?
+            {
+                Ok(mut sigs) => signatures.append(&mut sigs),
+                Err(error) => return Ok(error),
+            }
+        }
+
+        let data = serde_json::to_value(&signatures).expect("json serialization never fail");
+        Ok(RpcRequest::response_success(self.id, data))
+    }
+
+    async fn fetch_upstream(
+        &self,
+        state: Arc<State>,
+        upstream_disabled: bool,
+        deadline: Instant,
+        before: Option<Signature>,
+        limit: usize,
+    ) -> anyhow::Result<
+        Result<
+            Vec<RpcConfirmedTransactionStatusWithSignature>,
+            Response<'static, serde_json::Value>,
+        >,
+    > {
+        if let Some(upstream) = (!upstream_disabled)
+            .then_some(state.upstream.as_ref())
+            .flatten()
+        {
+            let response = upstream
+                .get_signatures_for_address(
+                    deadline,
+                    &self.id,
+                    self.address,
+                    before,
+                    self.until,
+                    limit,
+                    self.commitment,
+                )
+                .await?;
+
+            if let ResponsePayload::Error(_) = &response.payload {
+                return Ok(Err(response));
+            }
+
+            let ResponsePayload::Success(value) = response.payload else {
+                unreachable!();
+            };
+            serde_json::from_value(value.into_owned())
+                .context("failed to parse upstream response")
+                .map(Ok)
+        } else {
+            Ok(Ok(vec![]))
+        }
     }
 }
 
