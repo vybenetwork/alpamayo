@@ -44,13 +44,13 @@ trait ColumnName {
 }
 
 #[derive(Debug)]
-pub struct SlotIndex;
+pub struct SlotBasicIndex;
 
-impl ColumnName for SlotIndex {
-    const NAME: &'static str = "slot_index";
+impl ColumnName for SlotBasicIndex {
+    const NAME: &'static str = "slot_basic_index";
 }
 
-impl SlotIndex {
+impl SlotBasicIndex {
     pub fn key(slot: Slot) -> [u8; 8] {
         slot.to_be_bytes()
     }
@@ -64,33 +64,31 @@ impl SlotIndex {
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct SlotIndexValue {
+pub struct SlotBasicIndexValue {
     pub dead: bool,
     pub block_time: Option<UnixTimestamp>,
     pub block_height: Option<Slot>,
     pub storage_id: StorageId,
     pub offset: u64,
     pub size: u64,
-    pub transactions: Vec<[u8; 8]>,
-    pub sfa: Vec<[u8; 8]>,
 }
 
-impl SlotIndexValue {
+impl SlotBasicIndexValue {
     fn encode(&self, buf: &mut Vec<u8>) {
         if self.dead {
-            encode_varint(SlotIndexValueFlags::DEAD.bits() as u64, buf);
+            encode_varint(SlotBasicIndexValueFlags::DEAD.bits() as u64, buf);
             return;
         }
 
-        let mut flags = SlotIndexValueFlags::empty();
+        let mut flags = SlotBasicIndexValueFlags::empty();
         if self.dead {
-            flags |= SlotIndexValueFlags::DEAD;
+            flags |= SlotBasicIndexValueFlags::DEAD;
         }
         if self.block_time.is_some() {
-            flags |= SlotIndexValueFlags::BLOCK_TIME;
+            flags |= SlotBasicIndexValueFlags::BLOCK_TIME;
         }
         if self.block_height.is_some() {
-            flags |= SlotIndexValueFlags::BLOCK_HEIGHT;
+            flags |= SlotBasicIndexValueFlags::BLOCK_HEIGHT;
         }
 
         encode_varint(flags.bits() as u64, buf);
@@ -103,6 +101,79 @@ impl SlotIndexValue {
         encode_varint(self.storage_id as u64, buf);
         encode_varint(self.offset, buf);
         encode_varint(self.size, buf);
+    }
+
+    fn decode(mut slice: &[u8]) -> anyhow::Result<Self> {
+        let flags = SlotBasicIndexValueFlags::from_bits(
+            slice.try_get_u8().context("failed to read flags")?,
+        )
+        .context("invalid flags")?;
+
+        if flags.contains(SlotBasicIndexValueFlags::DEAD) {
+            return Ok(Self {
+                dead: true,
+                ..Default::default()
+            });
+        }
+
+        Ok(Self {
+            dead: false,
+            block_time: flags
+                .contains(SlotBasicIndexValueFlags::BLOCK_TIME)
+                .then(|| decode_varint(&mut slice).map(|bt| bt as i64))
+                .transpose()
+                .context("failed to read block time")?,
+            block_height: flags
+                .contains(SlotBasicIndexValueFlags::BLOCK_HEIGHT)
+                .then(|| decode_varint(&mut slice))
+                .transpose()
+                .context("failed to read block_height")?,
+            storage_id: decode_varint(&mut slice)
+                .context("failed to read storage id")?
+                .try_into()
+                .context("failed to convert storage id")?,
+            offset: decode_varint(&mut slice).context("failed to read offset")?,
+            size: decode_varint(&mut slice).context("failed to read size")?,
+        })
+    }
+}
+
+bitflags! {
+    struct SlotBasicIndexValueFlags: u8 {
+        const DEAD =         0b00000001;
+        const BLOCK_TIME =   0b00000010;
+        const BLOCK_HEIGHT = 0b00000100;
+    }
+}
+
+#[derive(Debug)]
+pub struct SlotExtraIndex;
+
+impl ColumnName for SlotExtraIndex {
+    const NAME: &'static str = "slot_extra_index";
+}
+
+impl SlotExtraIndex {
+    pub fn key(slot: Slot) -> [u8; 8] {
+        slot.to_be_bytes()
+    }
+
+    pub fn decode(slice: &[u8]) -> anyhow::Result<Slot> {
+        slice
+            .try_into()
+            .map(Slot::from_be_bytes)
+            .context("invalid slice size")
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SlotExtraIndexValue {
+    pub transactions: Vec<[u8; 8]>,
+    pub sfa: Vec<[u8; 8]>,
+}
+
+impl SlotExtraIndexValue {
+    fn encode(&self, buf: &mut Vec<u8>) {
         encode_varint(self.transactions.len() as u64, buf);
         for hash in self.transactions.iter() {
             buf.extend_from_slice(hash);
@@ -113,75 +184,33 @@ impl SlotIndexValue {
         }
     }
 
-    fn decode(mut slice: &[u8], decode_indexes: bool) -> anyhow::Result<Self> {
-        let flags =
-            SlotIndexValueFlags::from_bits(slice.try_get_u8().context("failed to read flags")?)
-                .context("invalid flags")?;
-
-        if flags.contains(SlotIndexValueFlags::DEAD) {
-            return Ok(Self {
-                dead: true,
-                ..Default::default()
-            });
-        }
-
-        Ok(Self {
-            dead: false,
-            block_time: flags
-                .contains(SlotIndexValueFlags::BLOCK_TIME)
-                .then(|| decode_varint(&mut slice).map(|bt| bt as i64))
-                .transpose()
-                .context("failed to read block time")?,
-            block_height: flags
-                .contains(SlotIndexValueFlags::BLOCK_HEIGHT)
-                .then(|| decode_varint(&mut slice))
-                .transpose()
-                .context("failed to read block_height")?,
-            storage_id: decode_varint(&mut slice)
-                .context("failed to read storage id")?
+    fn decode(mut slice: &[u8]) -> anyhow::Result<Self> {
+        let mut transactions = Vec::with_capacity(
+            decode_varint(&mut slice)
+                .context("failed to read transactions size")?
                 .try_into()
-                .context("failed to convert storage id")?,
-            offset: decode_varint(&mut slice).context("failed to read offset")?,
-            size: decode_varint(&mut slice).context("failed to read size")?,
-            transactions: if decode_indexes {
-                let mut transactions = Vec::with_capacity(
-                    decode_varint(&mut slice)
-                        .context("failed to read transactions size")?
-                        .try_into()
-                        .context("failed to convert transactions size")?,
-                );
-                for i in 0..transactions.capacity() {
-                    let hash = slice[i * 8..(i + 1) * 8].try_into().expect("valid slice");
-                    transactions.push(hash);
-                }
-                transactions
-            } else {
-                vec![]
-            },
-            sfa: if decode_indexes {
-                let mut sfa = Vec::with_capacity(
-                    decode_varint(&mut slice)
-                        .context("failed to read sfa size")?
-                        .try_into()
-                        .context("failed to convert sfa size")?,
-                );
-                for i in 0..sfa.capacity() {
-                    let hash = slice[i * 8..(i + 1) * 8].try_into().expect("valid slice");
-                    sfa.push(hash);
-                }
-                sfa
-            } else {
-                vec![]
-            },
-        })
-    }
-}
+                .context("failed to convert transactions size")?,
+        );
+        for i in 0..transactions.capacity() {
+            let hash = slice[i * 8..(i + 1) * 8].try_into().expect("valid slice");
+            transactions.push(hash);
+        }
+        slice.advance(transactions.len() * 8);
 
-bitflags! {
-    struct SlotIndexValueFlags: u8 {
-        const DEAD =         0b00000001;
-        const BLOCK_TIME =   0b00000010;
-        const BLOCK_HEIGHT = 0b00000100;
+        let mut sfa = Vec::with_capacity(
+            decode_varint(&mut slice)
+                .context("failed to read sfa size")?
+                .try_into()
+                .context("failed to convert sfa size")?,
+        );
+        for i in 0..sfa.capacity() {
+            let hash = slice[i * 8..(i + 1) * 8].try_into().expect("valid slice");
+            sfa.push(hash);
+        }
+        slice.advance(sfa.len() * 8);
+        anyhow::ensure!(slice.is_empty(), "invalid slice len, left: {}", slice.len());
+
+        Ok(Self { transactions, sfa })
     }
 }
 
@@ -440,7 +469,8 @@ impl Rocksdb {
 
     fn cf_descriptors() -> Vec<ColumnFamilyDescriptor> {
         vec![
-            Self::cf_descriptor::<SlotIndex>(),
+            Self::cf_descriptor::<SlotBasicIndex>(),
+            Self::cf_descriptor::<SlotExtraIndex>(),
             Self::cf_descriptor::<TransactionIndex>(),
             Self::cf_descriptor::<SfaIndex>(),
         ]
@@ -458,7 +488,7 @@ impl Rocksdb {
 
 #[derive(Debug)]
 enum WriteRequest {
-    TxSfaIndex {
+    AddIndexes {
         slot: Slot,
         block: Arc<BlockWithBinary>,
         tx: oneshot::Sender<anyhow::Result<()>>,
@@ -490,8 +520,19 @@ impl RocksdbWrite {
             };
 
             match request {
-                WriteRequest::TxSfaIndex { slot, block, tx } => {
+                WriteRequest::AddIndexes { slot, block, tx } => {
                     let mut batch = WriteBatch::with_capacity_bytes(2 * 1024 * 1024); // 2MiB
+                    buf.clear();
+                    SlotExtraIndexValue {
+                        transactions: block.txs_offset.iter().map(|txo| txo.key).collect(),
+                        sfa: block.sfa.values().map(|sfa| sfa.address_hash).collect(),
+                    }
+                    .encode(&mut buf);
+                    batch.put_cf(
+                        Rocksdb::cf_handle::<SlotExtraIndex>(&db),
+                        SlotExtraIndex::key(slot),
+                        &buf,
+                    );
                     for tx_offset in block.txs_offset.iter() {
                         buf.clear();
                         TransactionIndexValue {
@@ -521,18 +562,16 @@ impl RocksdbWrite {
                 WriteRequest::SlotAdd { slot, data, tx } => {
                     buf.clear();
                     if let Some((block, storage_id, offset)) = data {
-                        SlotIndexValue {
+                        SlotBasicIndexValue {
                             dead: false,
                             block_time: block.block_time,
                             block_height: block.block_height,
                             storage_id,
                             offset,
                             size: block.protobuf.len() as u64,
-                            transactions: block.txs_offset.iter().map(|txo| txo.key).collect(),
-                            sfa: block.sfa.values().map(|sfa| sfa.address_hash).collect(),
                         }
                     } else {
-                        SlotIndexValue {
+                        SlotBasicIndexValue {
                             dead: true,
                             ..Default::default()
                         }
@@ -540,8 +579,8 @@ impl RocksdbWrite {
                     .encode(&mut buf);
 
                     let result = db.put_cf(
-                        Rocksdb::cf_handle::<SlotIndex>(&db),
-                        SlotIndex::key(slot),
+                        Rocksdb::cf_handle::<SlotBasicIndex>(&db),
+                        SlotBasicIndex::key(slot),
                         &buf,
                     );
                     if tx.send(result.map_err(Into::into)).is_err() {
@@ -559,17 +598,27 @@ impl RocksdbWrite {
 
     fn spawn_remove_slot(db: &DB, slot: Slot) -> anyhow::Result<()> {
         let value = db
-            .get_pinned_cf(Rocksdb::cf_handle::<SlotIndex>(db), SlotIndex::key(slot))
+            .get_pinned_cf(
+                Rocksdb::cf_handle::<SlotExtraIndex>(db),
+                SlotExtraIndex::key(slot),
+            )
             .context("failed to get existed slot")?
             .ok_or_else(|| anyhow::anyhow!("existed slot {slot} not found"))?;
-        let value = SlotIndexValue::decode(&value, true).context("failed to decode slot data")?;
+        let block = SlotExtraIndexValue::decode(&value).context("failed to decode slot data")?;
 
         let mut batch = WriteBatch::with_capacity_bytes(128 * 1024); // 128KiB
-        batch.delete_cf(Rocksdb::cf_handle::<SlotIndex>(db), SlotIndex::key(slot));
-        for hash in value.transactions {
+        batch.delete_cf(
+            Rocksdb::cf_handle::<SlotBasicIndex>(db),
+            SlotBasicIndex::key(slot),
+        );
+        batch.delete_cf(
+            Rocksdb::cf_handle::<SlotExtraIndex>(db),
+            SlotExtraIndex::key(slot),
+        );
+        for hash in block.transactions {
             batch.delete_cf(Rocksdb::cf_handle::<TransactionIndex>(db), hash);
         }
-        for hash in value.sfa {
+        for hash in block.sfa {
             batch.delete_cf(
                 Rocksdb::cf_handle::<SfaIndex>(db),
                 SfaIndex::concat(hash, slot),
@@ -629,7 +678,7 @@ impl RocksdbWrite {
             async move {
                 let (tx, rx) = oneshot::channel();
                 self.req_tx
-                    .send(WriteRequest::TxSfaIndex {
+                    .send(WriteRequest::AddIndexes {
                         slot,
                         block: Arc::clone(&block),
                         tx,
@@ -772,14 +821,17 @@ impl RocksdbRead {
 
     fn spawn_slots(db: &DB) -> anyhow::Result<Vec<StoredBlock>> {
         let mut slots = vec![];
-        for item in db.iterator_cf(Rocksdb::cf_handle::<SlotIndex>(db), IteratorMode::Start) {
+        for item in db.iterator_cf(
+            Rocksdb::cf_handle::<SlotBasicIndex>(db),
+            IteratorMode::Start,
+        ) {
             let (key, value) = item.context("failed to get next item")?;
             let value =
-                SlotIndexValue::decode(&value, false).context("failed to decode slot data")?;
+                SlotBasicIndexValue::decode(&value).context("failed to decode slot data")?;
             slots.push(StoredBlock {
                 exists: true,
                 dead: value.dead,
-                slot: SlotIndex::decode(&key).context("failed to decode slot key")?,
+                slot: SlotBasicIndex::decode(&key).context("failed to decode slot key")?,
                 block_time: value.block_time,
                 block_height: value.block_height,
                 storage_id: value.storage_id,
