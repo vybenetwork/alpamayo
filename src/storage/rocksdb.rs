@@ -25,6 +25,7 @@ use {
         clock::{Slot, UnixTimestamp},
         pubkey::Pubkey,
         signature::Signature,
+        transaction::TransactionError,
     },
     std::{
         borrow::Cow,
@@ -228,25 +229,44 @@ impl TransactionIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct TransactionIndexValue {
+#[derive(Debug, Clone)]
+pub struct TransactionIndexValue<'a> {
     pub slot: Slot,
     pub offset: u64,
     pub size: u64,
+    pub err: Option<Cow<'a, TransactionError>>,
 }
 
-impl TransactionIndexValue {
+impl TransactionIndexValue<'_> {
     fn encode(&self, buf: &mut Vec<u8>) {
         encode_varint(self.slot, buf);
         encode_varint(self.offset, buf);
         encode_varint(self.size, buf);
+        if let Some(err) = &self.err {
+            let data = bincode::serialize(err).expect("bincode never fail");
+            encode_varint(data.len() as u64, buf);
+            buf.extend_from_slice(&data);
+        }
     }
 
-    fn decode(mut slice: &[u8]) -> anyhow::Result<Self> {
+    fn decode(mut slice: &[u8], decode_error: bool) -> anyhow::Result<Self> {
         Ok(Self {
             slot: decode_varint(&mut slice).context("failed to decode slot")?,
             offset: decode_varint(&mut slice).context("failed to decode offset")?,
             size: decode_varint(&mut slice).context("failed to decode size")?,
+            err: if slice.is_empty() || !decode_error {
+                None
+            } else {
+                let size = decode_varint(&mut slice).context("failed to decode err size")? as usize;
+                anyhow::ensure!(
+                    slice.remaining() == size,
+                    "invalid slice len to decode err, expected {} left {}",
+                    size,
+                    slice.remaining()
+                );
+                let err = bincode::deserialize(&slice[0..size]).context("failed to decode err")?;
+                Some(Cow::Owned(err))
+            },
         })
     }
 }
@@ -545,6 +565,7 @@ impl RocksdbWrite {
                             slot,
                             offset: tx_offset.offset,
                             size: tx_offset.size,
+                            err: tx_offset.err.as_ref().map(Cow::Borrowed),
                         }
                         .encode(&mut buf);
                         batch.put_cf(
@@ -756,7 +777,8 @@ enum ReadRequest {
     },
     Transaction {
         signature: Signature,
-        tx: oneshot::Sender<anyhow::Result<Option<TransactionIndexValue>>>,
+        decode_error: bool,
+        tx: oneshot::Sender<anyhow::Result<Option<TransactionIndexValue<'static>>>>,
     },
     SignaturesForAddress {
         address: Pubkey,
@@ -790,12 +812,18 @@ impl RocksdbRead {
                         break;
                     }
                 }
-                ReadRequest::Transaction { signature, tx } => {
+                ReadRequest::Transaction {
+                    signature,
+                    decode_error,
+                    tx,
+                } => {
                     let result = match db.get_pinned_cf(
                         Rocksdb::cf_handle::<TransactionIndex>(&db),
                         TransactionIndex::encode(&signature),
                     ) {
-                        Ok(Some(slice)) => TransactionIndexValue::decode(slice.as_ref()).map(Some),
+                        Ok(Some(slice)) => {
+                            TransactionIndexValue::decode(slice.as_ref(), decode_error).map(Some)
+                        }
                         Ok(None) => Ok(None),
                         Err(error) => Err(anyhow::anyhow!("failed to get tx location: {error:?}")),
                     };
@@ -917,10 +945,16 @@ impl RocksdbRead {
     pub fn read_tx_index(
         &self,
         signature: Signature,
-    ) -> anyhow::Result<BoxFuture<'static, anyhow::Result<Option<TransactionIndexValue>>>> {
+        decode_error: bool,
+    ) -> anyhow::Result<BoxFuture<'static, anyhow::Result<Option<TransactionIndexValue<'static>>>>>
+    {
         let (tx, rx) = oneshot::channel();
         self.req_tx
-            .send(ReadRequest::Transaction { signature, tx })
+            .send(ReadRequest::Transaction {
+                signature,
+                decode_error,
+                tx,
+            })
             .context("failed to send ReadRequest::Transaction request")?;
         Ok(Box::pin(async move {
             rx.await
