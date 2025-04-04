@@ -45,13 +45,17 @@ impl StoredBlocksWrite {
             .map(|(index, _block)| index)
             .unwrap_or_else(|| blocks.len() - 1);
 
-        Ok(Self {
+        let this = Self {
             blocks,
             tail,
             head,
-            stored_slots,
+            stored_slots: stored_slots.clone(),
             sync_tx,
-        })
+        };
+
+        stored_slots.first_available_store(this.front_slot());
+
+        Ok(this)
     }
 
     pub fn to_read(&self) -> StoredBlocksRead {
@@ -127,6 +131,7 @@ impl StoredBlocksWrite {
         if self.blocks[self.tail].exists {
             let block = std::mem::replace(&mut self.blocks[self.tail], StoredBlock::new_noexists());
             self.tail = (self.tail + 1) % self.blocks.len();
+            self.stored_slots.first_available_store(self.front_slot());
             Some(block)
         } else {
             None
@@ -144,10 +149,10 @@ impl StoredBlocksWrite {
             if block.exists {
                 return Some(block.slot);
             }
-            index = (index + 1) % self.blocks.len();
             if index == self.head {
                 break;
             }
+            index = (index + 1) % self.blocks.len();
         }
         None
     }
