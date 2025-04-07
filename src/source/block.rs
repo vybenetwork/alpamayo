@@ -1,5 +1,8 @@
 use {
-    crate::source::{sfa::SignaturesForAddress, transaction::TransactionWithBinary},
+    crate::{
+        source::{sfa::SignaturesForAddress, transaction::TransactionWithBinary},
+        util::HashMap,
+    },
     prost::{
         DecodeError, Message,
         bytes::{Buf, BufMut},
@@ -15,10 +18,7 @@ use {
     },
     solana_storage_proto::convert::generated,
     solana_transaction_status::{Reward, RewardType, Rewards},
-    std::{
-        collections::{HashMap, hash_map::Entry as HashMapEntry},
-        ops::Deref,
-    },
+    std::{collections::hash_map::Entry as HashMapEntry, ops::Deref},
 };
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,7 @@ pub struct BlockTransactionOffset {
 
 #[derive(Debug)]
 pub struct BlockWithBinary {
+    pub blockhash: String,
     pub parent_slot: Slot,
     pub block_time: Option<UnixTimestamp>,
     pub block_height: Option<Slot>,
@@ -65,7 +66,7 @@ impl BlockWithBinary {
         }
         .encode_with_tx_offsets();
 
-        let mut sfa = HashMap::<Pubkey, SignaturesForAddress>::new();
+        let mut sfa = HashMap::<Pubkey, SignaturesForAddress>::default();
         for tx in transactions.iter_mut().rev() {
             for tx_sfa in tx.sfa.drain(..) {
                 match sfa.entry(tx_sfa.address) {
@@ -85,6 +86,7 @@ impl BlockWithBinary {
             .collect();
 
         Self {
+            blockhash,
             parent_slot,
             block_time,
             block_height,
