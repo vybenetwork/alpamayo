@@ -6,7 +6,7 @@ use {
             blocks::{StorageBlockLocationResult, StoredBlocksRead},
             files::StorageFilesRead,
             rocksdb::{RocksdbRead, TransactionIndexValue},
-            slots::StoredConfirmedSlot,
+            slots::StoredSlotsRead,
             sync::ReadWriteSyncMessage,
         },
         util::HashMap,
@@ -49,7 +49,7 @@ pub fn start(
     mut sync_rx: broadcast::Receiver<ReadWriteSyncMessage>,
     read_requests_concurrency: Arc<Semaphore>,
     requests_rx: Arc<Mutex<mpsc::Receiver<ReadRequest>>>,
-    stored_confirmed_slot: StoredConfirmedSlot,
+    mut stored_slots_read: StoredSlotsRead,
 ) -> anyhow::Result<thread::JoinHandle<anyhow::Result<()>>> {
     thread::Builder::new()
         .name(format!("alpStorageRd{index:02}"))
@@ -59,15 +59,22 @@ pub fn start(
                     affinity::set_thread_affinity(&cpus).expect("failed to set affinity")
                 }
 
+                let mut confirmed_in_process = None;
+                let mut storage_processed = StorageProcessed::default();
+                let mut read_requests = FuturesUnordered::new();
                 let (mut blocks, db_read, storage_files) = match sync_rx.recv().await {
                     Ok(ReadWriteSyncMessage::Init {
                         blocks,
                         db_read,
                         storage_files_init,
+                        recent_blocks,
                     }) => {
                         let storage_files = StorageFilesRead::open(storage_files_init)
                             .await
                             .context("failed to open storage files")?;
+                        for (slot, block) in recent_blocks {
+                            storage_processed.set_confirmed(slot, Some(block));
+                        }
                         (blocks, db_read, storage_files)
                     }
                     Ok(_) => anyhow::bail!("invalid sync message"),
@@ -76,9 +83,7 @@ pub fn start(
                         anyhow::bail!("read runtime lagged")
                     }
                 };
-                let mut confirmed_in_process = None;
-                let mut storage_processed = StorageProcessed::default();
-                let mut read_requests = FuturesUnordered::new();
+                stored_slots_read.set_ready(storage_processed.is_ready());
 
                 let result = start2(
                     index,
@@ -91,7 +96,7 @@ pub fn start(
                     read_requests_concurrency,
                     requests_rx,
                     &mut read_requests,
-                    stored_confirmed_slot,
+                    stored_slots_read,
                 )
                 .await;
 
@@ -132,7 +137,7 @@ async fn start2(
     read_requests_concurrency: Arc<Semaphore>,
     read_requests_rx: Arc<Mutex<mpsc::Receiver<ReadRequest>>>,
     read_requests: &mut FuturesUnordered<LocalBoxFuture<'_, Option<ReadRequest>>>,
-    stored_confirmed_slot: StoredConfirmedSlot,
+    mut stored_slots_read: StoredSlotsRead,
 ) -> anyhow::Result<()> {
     let read_request_next =
         read_request_get_next(Arc::clone(&read_requests_concurrency), read_requests_rx);
@@ -150,14 +155,16 @@ async fn start2(
             // sync update
             message = sync_rx.recv() => match message {
                 Ok(ReadWriteSyncMessage::Init { .. }) => anyhow::bail!("unexpected second init"),
-                Ok(ReadWriteSyncMessage::BlockNew { slot, block }) => storage_processed.add(slot, block),
+                Ok(ReadWriteSyncMessage::BlockNew { slot, block }) => storage_processed.add_processed_block(slot, block),
                 Ok(ReadWriteSyncMessage::BlockDead { slot }) => storage_processed.mark_dead(slot),
                 Ok(ReadWriteSyncMessage::BlockConfirmed { slot, block }) => {
-                    stored_confirmed_slot.set_confirmed(index, slot);
+                    stored_slots_read.set_confirmed(index, slot);
                     storage_processed.set_confirmed(slot, block.clone());
+                    stored_slots_read.set_ready(storage_processed.is_ready());
                     *confirmed_in_process = Some((slot, block));
                 },
                 Ok(ReadWriteSyncMessage::SlotFinalized { slot }) => {
+                    stored_slots_read.set_finalized(index, slot);
                     storage_processed.set_finalized(slot);
                 }
                 Ok(ReadWriteSyncMessage::ConfirmedBlockPop) => blocks.pop_block(),
@@ -317,7 +324,7 @@ impl StorageProcessed {
         }
     }
 
-    fn add(&mut self, slot: Slot, block: Arc<BlockWithBinary>) {
+    fn add_processed_block(&mut self, slot: Slot, block: Arc<BlockWithBinary>) {
         self.add_signatures(slot, &block);
         if let BTreeMapEntry::Vacant(entry) = self.blocks.entry(slot) {
             entry.insert(Some(block));
@@ -335,16 +342,16 @@ impl StorageProcessed {
     }
 
     fn set_confirmed(&mut self, slot: Slot, block: Option<Arc<BlockWithBinary>>) {
+        if let Some(block) = &block {
+            self.add_signatures(slot, block);
+        }
+
         self.confirmed_slot = slot;
         self.confirmed_height = self
             .recent_blocks
             .get(&slot)
             .map(|rb| rb.block_height)
             .unwrap_or(self.confirmed_height);
-
-        if let Some(block) = &block {
-            self.add_signatures(slot, block);
-        }
 
         loop {
             match self.blocks.first_key_value() {
@@ -357,7 +364,10 @@ impl StorageProcessed {
         loop {
             match self.recent_blocks.first_key_value() {
                 Some((_slot, block))
-                    if (self.confirmed_height - block.block_height) as usize
+                    if self
+                        .confirmed_height
+                        .checked_sub(block.block_height)
+                        .unwrap_or_default() as usize
                         >= MAX_RECENT_BLOCKHASHES =>
                 {
                     if let Some((_slot, block)) = self.recent_blocks.pop_first() {
@@ -376,6 +386,10 @@ impl StorageProcessed {
             .get(&slot)
             .map(|rb| rb.block_height)
             .unwrap_or(self.finalized_height);
+    }
+
+    fn is_ready(&self) -> bool {
+        self.recent_blocks.len() >= MAX_RECENT_BLOCKHASHES
     }
 
     fn get_processed_block(&self, slot: Slot) -> Option<&Arc<BlockWithBinary>> {

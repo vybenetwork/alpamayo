@@ -9,7 +9,7 @@ use {
         },
         storage::{
             blocks::StoredBlocksWrite,
-            files::StorageFilesWrite,
+            files::{StorageFilesRead, StorageFilesWrite},
             memory::{MemoryConfirmedBlock, StorageMemory},
             rocksdb::{RocksdbRead, RocksdbWrite},
             slots::StoredSlots,
@@ -20,11 +20,18 @@ use {
     },
     anyhow::Context,
     futures::{
-        future::{FutureExt, pending},
+        future::{FutureExt, pending, try_join_all},
         stream::{FuturesUnordered, StreamExt},
+    },
+    prost::Message,
+    rayon::{
+        ThreadPoolBuilder,
+        iter::{IntoParallelIterator, ParallelIterator},
     },
     richat_shared::shutdown::Shutdown,
     solana_sdk::clock::Slot,
+    solana_storage_proto::convert::generated,
+    solana_transaction_status::ConfirmedBlock,
     std::{
         sync::Arc,
         thread,
@@ -35,7 +42,7 @@ use {
         task::{JoinHandle, spawn_local},
         time::sleep,
     },
-    tracing::warn,
+    tracing::{info, warn},
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +60,10 @@ pub fn start(
     thread::Builder::new()
         .name("alpStorageWrt".to_owned())
         .spawn(move || {
+            let recent_blocks_thread_pool = ThreadPoolBuilder::new()
+                .build()
+                .context("failed to build thread pool to decode recent blocks")?;
+
             tokio_uring::start(async move {
                 if let Some(cpus) = config.write.affinity {
                     affinity::set_thread_affinity(&cpus).expect("failed to set affinity")
@@ -74,11 +85,72 @@ pub fn start(
                     StorageFilesWrite::open(files, &blocks).await?;
                 let storage_memory = StorageMemory::default();
 
+                // load recent blocks
+                let ts = Instant::now();
+                let recent_blocks =
+                    match try_join_all(blocks.get_recent_blocks().into_iter().map(|stored_block| {
+                        let storage_files_init = storage_files_read_sync_init.clone();
+                        async move {
+                            let storage_files = StorageFilesRead::open(storage_files_init)
+                                .await
+                                .context("failed to open storage files")?;
+
+                            storage_files
+                                .read(
+                                    stored_block.storage_id,
+                                    stored_block.offset,
+                                    stored_block.size,
+                                )
+                                .await
+                                .context("failed to read block buffer")
+                                .map(|bytes| (stored_block.slot, bytes))
+                        }
+                    }))
+                    .await
+                    .context("failed to load recent blocks")
+                    .and_then(|items| {
+                        recent_blocks_thread_pool.install(|| {
+                            items
+                                .into_par_iter()
+                                .map(|(slot, bytes)| {
+                                    match generated::ConfirmedBlock::decode(bytes.as_ref())
+                                    .context("failed to decode protobuf")
+                                {
+                                    Ok(block) => match ConfirmedBlock::try_from(block)
+                                        .context("failed to convert to confirmed block")
+                                    {
+                                        Ok(block) => Ok((
+                                            slot,
+                                            Arc::new(
+                                                BlockWithBinary::new_from_confirmed_block_and_slot(
+                                                    block, slot,
+                                                ),
+                                            ),
+                                        )),
+                                        Err(error) => Err(error),
+                                    },
+                                    Err(error) => Err(error),
+                                }
+                                })
+                                .collect::<Result<Vec<_>, anyhow::Error>>()
+                        })
+                    }) {
+                        Ok(recent_blocks) => recent_blocks,
+                        Err(error) => {
+                            storage_files.close().await;
+                            return Err(error);
+                        }
+                    };
+                info!(len = recent_blocks.len(), elapsed = ?ts.elapsed(), "load recent blocks");
+                drop(recent_blocks_thread_pool);
+
+                // notify readers
                 sync_tx
                     .send(ReadWriteSyncMessage::Init {
                         blocks: blocks.to_read(),
                         db_read: db_read.clone(),
                         storage_files_init: storage_files_read_sync_init,
+                        recent_blocks,
                     })
                     .context("failed to send read/write init message")?;
 
@@ -268,7 +340,6 @@ async fn start2(
                                 },
                                 StreamSourceSlotStatus::Confirmed => storage_memory.set_confirmed(slot),
                                 StreamSourceSlotStatus::Finalized => {
-                                    stored_slots.finalized_store(slot);
                                     let _ = sync_tx.send(ReadWriteSyncMessage::SlotFinalized { slot });
                                 },
                             }
@@ -278,7 +349,6 @@ async fn start2(
                                 match status {
                                     StreamSourceSlotStatus::Confirmed => stored_slots.confirmed_store(slot),
                                     StreamSourceSlotStatus::Finalized => {
-                                        stored_slots.finalized_store(slot);
                                         let _ = sync_tx.send(ReadWriteSyncMessage::SlotFinalized { slot });
                                     }
                                     _ => unreachable!(),
