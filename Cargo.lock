@@ -64,15 +64,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "affinity"
-version = "0.1.2"
+name = "affinity-linux"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "763e484feceb7dd021b21c5c6f81aee06b1594a743455ec7efbf72e6355e447b"
+checksum = "119038623e6a2eda09deff65fa7dec3a9b963254cbed11d23aa8a2484b3693fc"
 dependencies = [
- "cfg-if",
  "errno",
  "libc",
- "num_cpus",
 ]
 
 [[package]]
@@ -116,7 +114,7 @@ dependencies = [
 name = "alpamayo"
 version = "0.1.0"
 dependencies = [
- "affinity",
+ "affinity-linux",
  "anyhow",
  "base64 0.22.1",
  "bincode",
@@ -1112,9 +1110,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-channel"
-version = "0.5.14"
+version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06ba6d68e24814cb8de6bb986db8222d3a027d15872cabc0d18817bc3c0e4471"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2096,7 +2094,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.5.8",
+ "socket2 0.4.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2559,9 +2557,9 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libc"
-version = "0.2.170"
+version = "0.2.171"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "875b3680cb2f8f71bdcf9a30f38d48282f5d3c95cbf9b3fa57269bb5d5c06828"
+checksum = "c19937216e9d3aa9956d9bb8dfc0b0c8beb6058fc4f7a4dc4d850edf86a237d6"
 
 [[package]]
 name = "libloading"
@@ -2570,7 +2568,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc2f4eb4bc735547cfed7c0a4922cbd04a4655978c09b54f1f7b228750664c34"
 dependencies = [
  "cfg-if",
- "windows-targets 0.52.6",
+ "windows-targets 0.48.5",
 ]
 
 [[package]]
@@ -3860,9 +3858,9 @@ dependencies = [
 
 [[package]]
 name = "richat-client"
-version = "2.2.0"
+version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "657837fb0f81c3373f326347d94d1a100a4ca53b48e88cd99e2fa6133eeca953"
+checksum = "16a503fbc5121b99f887cdb7ac147cb8b77298c86cdce4041202b70ae505a9ce"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3902,11 +3900,11 @@ dependencies = [
 
 [[package]]
 name = "richat-shared"
-version = "2.5.0"
+version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "674e94ac10554082e0c090ddd9cd5aa811b255834f9c133fe9ee99c1ce362304"
+checksum = "a575f9596295aa23463ad635f671b8800ffb94e10892db547273691f434ebf28"
 dependencies = [
- "affinity",
+ "affinity-linux",
  "anyhow",
  "base64 0.22.1",
  "bs58",
@@ -6238,9 +6236,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.43.0"
+version = "1.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d61fa4ffa3de412bfea335c6ecff681de2b609ba3c77ef3e00e521813a9ed9e"
+checksum = "e6b88822cbe49de4185e3a4cbf8321dd487cf5fe0c5c65695fef6346371e9c48"
 dependencies = [
  "backtrace",
  "bytes",
