@@ -147,6 +147,14 @@ impl StoredBlocksWrite {
             self.stored_slots.first_available_store(self.front_slot());
         }
 
+        // set total
+        let total = if self.head >= self.tail {
+            self.head - self.tail + 1
+        } else {
+            (self.blocks.len() - self.tail) + self.head + 1
+        };
+        self.stored_slots.set_total(total);
+
         Ok(())
     }
 
@@ -302,7 +310,7 @@ impl StoredBlock {
         }
     }
 
-    fn new_confirmed(
+    const fn new_confirmed(
         slot: Slot,
         block_time: Option<UnixTimestamp>,
         block_height: Option<Slot>,
@@ -330,7 +338,7 @@ pub struct StorageBlocksBoundaries {
 }
 
 impl StorageBlocksBoundaries {
-    fn update(&mut self, block: &StoredBlock) {
+    const fn update(&mut self, block: &StoredBlock) {
         if let Some(min) = &mut self.min {
             if block.slot < min.slot {
                 *min = *block;
@@ -378,7 +386,7 @@ impl From<StoredBlock> for StoredBlockPushSync {
 }
 
 impl StoredBlockPushSync {
-    pub fn slot(&self) -> Slot {
+    pub const fn slot(&self) -> Slot {
         self.block.slot
     }
 }

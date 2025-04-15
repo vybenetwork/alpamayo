@@ -1,6 +1,10 @@
 use {
     crate::{
         config::{ConfigRpc, ConfigRpcCall},
+        metrics::{
+            RPC_REQUESTS_DURATION_SECONDS, RPC_REQUESTS_GENERATED_BYTES_TOTAL, RPC_REQUESTS_TOTAL,
+            RPC_WORKERS_CPU_SECONDS_TOTAL, duration_to_seconds,
+        },
         rpc::{upstream::RpcClient, workers::WorkRequest},
         storage::{
             read::{
@@ -26,6 +30,7 @@ use {
         Id, Params, Request, Response, ResponsePayload, TwoPointZero,
         error::{ErrorCode, ErrorObject, ErrorObjectOwned, INVALID_PARAMS_MSG},
     },
+    metrics::{counter, gauge, histogram},
     prost::Message,
     serde::{Deserialize, Serialize, de},
     solana_rpc_client_api::{
@@ -187,6 +192,74 @@ impl SupportedCalls {
         anyhow::ensure!(count <= 1, "{call:?} defined multiple times");
         Ok(count == 1)
     }
+
+    fn get_method(&self, method: &str) -> RpcRequestMethod {
+        match method {
+            "getBlock" if self.get_block => RpcRequestMethod::GetBlock,
+            "getBlockHeight" if self.get_block_height => RpcRequestMethod::GetBlockHeight,
+            "getBlocks" if self.get_blocks => RpcRequestMethod::GetBlocks,
+            "getBlocksWithLimit" if self.get_blocks_with_limit => {
+                RpcRequestMethod::GetBlocksWithLimit
+            }
+            "getBlockTime" if self.get_block_time => RpcRequestMethod::GetBlockTime,
+            "getLatestBlockhash" if self.get_latest_blockhash => {
+                RpcRequestMethod::GetLatestBlockhash
+            }
+            "getRecentPrioritizationFees" if self.get_recent_prioritization_fees => {
+                RpcRequestMethod::GetRecentPrioritizationFees
+            }
+            "getSignaturesForAddress" if self.get_signatures_for_address => {
+                RpcRequestMethod::GetSignaturesForAddress
+            }
+            "getSignatureStatuses" if self.get_signature_statuses => {
+                RpcRequestMethod::GetSignatureStatuses
+            }
+            "getSlot" if self.get_slot => RpcRequestMethod::GetSlot,
+            "getTransaction" if self.get_transaction => RpcRequestMethod::GetTransaction,
+            "getVersion" if self.get_version => RpcRequestMethod::GetVersion,
+            "isBlockhashValid" if self.is_blockhash_valid => RpcRequestMethod::IsBlockhashValid,
+            _ => RpcRequestMethod::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RpcRequestMethod {
+    GetBlock,
+    GetBlockHeight,
+    GetBlocks,
+    GetBlocksWithLimit,
+    GetBlockTime,
+    GetLatestBlockhash,
+    GetRecentPrioritizationFees,
+    GetSignaturesForAddress,
+    GetSignatureStatuses,
+    GetSlot,
+    GetTransaction,
+    GetVersion,
+    IsBlockhashValid,
+    Unknown,
+}
+
+impl RpcRequestMethod {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::GetBlock => "getBlock",
+            Self::GetBlockHeight => "getBlockHeight",
+            Self::GetBlocks => "getBlocks",
+            Self::GetBlocksWithLimit => "getBlocksWithLimit",
+            Self::GetBlockTime => "getBlockTime",
+            Self::GetLatestBlockhash => "getLatestBlockhash",
+            Self::GetRecentPrioritizationFees => "getRecentPrioritizationFees",
+            Self::GetSignaturesForAddress => "getSignaturesForAddress",
+            Self::GetSignatureStatuses => "getSignatureStatuses",
+            Self::GetSlot => "getSlot",
+            Self::GetTransaction => "getTransaction",
+            Self::GetVersion => "getVersion",
+            Self::IsBlockhashValid => "isBlockhashValid",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -231,6 +304,13 @@ pub async fn on_request(
 ) -> HttpResult<RpcResponse> {
     let (parts, body) = req.into_parts();
 
+    let x_subscription_id: Arc<str> = parts
+        .headers
+        .get("x-subscription-id")
+        .and_then(|value| value.to_str().ok().map(ToOwned::to_owned))
+        .unwrap_or_default()
+        .into();
+
     // Same name as in Agave Rpc
     let upstream_disabled = parts
         .headers
@@ -247,25 +327,28 @@ pub async fn on_request(
         Err(error) => return response_400(error),
     };
     let mut buffer = match requests {
-        RpcRequests::Single(request) => match RpcRequest::parse(request, &state) {
-            Ok(request) => match request.process(Arc::clone(&state), upstream_disabled).await {
-                Ok(response) => {
-                    serde_json::to_vec(&response).expect("json serialization never fail")
-                }
-                Err(error) => return response_500(error),
-            },
-            Err(error) => serde_json::to_vec(&error).expect("json serialization never fail"),
+        RpcRequests::Single(request) => match RpcRequest::process(
+            Arc::clone(&state),
+            request,
+            Arc::clone(&x_subscription_id),
+            upstream_disabled,
+        )
+        .await
+        {
+            Ok(response) => serde_json::to_vec(&response).expect("json serialization never fail"),
+            Err(error) => return response_500(error),
         },
         RpcRequests::Batch(requests) => {
             let mut futures = FuturesOrdered::new();
             for request in requests {
-                let state = state.clone();
-                futures.push_back(async move {
-                    match RpcRequest::parse(request, &state) {
-                        Ok(request) => request.process(state, upstream_disabled).await,
-                        Err(error) => Ok(error),
-                    }
-                });
+                let state = Arc::clone(&state);
+                let x_subscription_id = Arc::clone(&x_subscription_id);
+                futures.push_back(RpcRequest::process(
+                    state,
+                    request,
+                    x_subscription_id,
+                    upstream_disabled,
+                ));
             }
 
             let mut buffer = Vec::new();
@@ -285,6 +368,11 @@ pub async fn on_request(
         }
     };
     buffer.push(b'\n');
+    counter!(
+        RPC_REQUESTS_GENERATED_BYTES_TOTAL,
+        "x_subscription_id" => x_subscription_id,
+    )
+    .increment(buffer.len() as u64);
     response_200(buffer)
 }
 
@@ -321,12 +409,54 @@ enum RpcRequest {
 }
 
 impl RpcRequest {
+    async fn process(
+        state: Arc<State>,
+        request: Request<'_>,
+        x_subscription_id: Arc<str>,
+        upstream_disabled: bool,
+    ) -> anyhow::Result<Response<'_, serde_json::Value>> {
+        let ts = quanta::Instant::now();
+        let method = state.supported_calls.get_method(request.method.as_ref());
+        counter!(
+            RPC_REQUESTS_TOTAL,
+            "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "method" => method.as_str(),
+        )
+        .increment(1);
+        let result = match Self::parse(&state, request, Arc::clone(&x_subscription_id), method) {
+            Ok(request) => match request {
+                Self::Block(request) => request.process(state, upstream_disabled).await,
+                Self::BlockHeight(request) => request.process(state).await,
+                Self::Blocks(request) => request.process(state, upstream_disabled).await,
+                Self::BlockTime(request) => request.process(state, upstream_disabled).await,
+                Self::LatestBlockhash(request) => request.process(state).await,
+                Self::RecentPrioritizationFees(request) => request.process(state).await,
+                Self::SignaturesForAddress(request) => {
+                    request.process(state, upstream_disabled).await
+                }
+                Self::SignatureStatuses(request) => request.process(state, upstream_disabled).await,
+                Self::Transaction(request) => request.process(state, upstream_disabled).await,
+                Self::IsBlockhashValid(request) => request.process(state).await,
+            },
+            Err(error) => Ok(error),
+        };
+        histogram!(
+            RPC_REQUESTS_DURATION_SECONDS,
+            "x_subscription_id" => x_subscription_id,
+            "method" => method.as_str(),
+        )
+        .record(duration_to_seconds(ts.elapsed()));
+        result
+    }
+
     fn parse<'a>(
-        request: Request<'a>,
         state: &Arc<State>,
+        request: Request<'a>,
+        x_subscription_id: Arc<str>,
+        method: RpcRequestMethod,
     ) -> Result<Self, Response<'a, serde_json::Value>> {
-        match request.method.as_ref() {
-            "getBlock" if state.supported_calls.get_block => {
+        match method {
+            RpcRequestMethod::GetBlock => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     slot: Slot,
@@ -351,6 +481,7 @@ impl RpcRequest {
                 }
 
                 Ok(Self::Block(RpcRequestBlock {
+                    x_subscription_id,
                     id: id.into_owned(),
                     slot,
                     commitment,
@@ -358,7 +489,7 @@ impl RpcRequest {
                     encoding_options,
                 }))
             }
-            "getBlockHeight" if state.supported_calls.get_block_height => {
+            RpcRequestMethod::GetBlockHeight => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     #[serde(default)]
@@ -379,7 +510,7 @@ impl RpcRequest {
                     commitment,
                 }))
             }
-            "getBlocks" if state.supported_calls.get_blocks => {
+            RpcRequestMethod::GetBlocks => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     start_slot: Slot,
@@ -441,13 +572,14 @@ impl RpcRequest {
                 }
 
                 Ok(Self::Blocks(RpcRequestBlocks {
+                    x_subscription_id,
                     id: id.into_owned(),
                     start_slot,
                     until: RpcRequestBlocksUntil::EndSlot(end_slot),
                     commitment,
                 }))
             }
-            "getBlocksWithLimit" if state.supported_calls.get_blocks_with_limit => {
+            RpcRequestMethod::GetBlocksWithLimit => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     start_slot: Slot,
@@ -496,13 +628,14 @@ impl RpcRequest {
                 }
 
                 Ok(Self::Blocks(RpcRequestBlocks {
+                    x_subscription_id,
                     id: id.into_owned(),
                     start_slot,
                     until: RpcRequestBlocksUntil::Limit(limit),
                     commitment,
                 }))
             }
-            "getBlockTime" if state.supported_calls.get_block_time => {
+            RpcRequestMethod::GetBlockTime => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     slot: Slot,
@@ -514,12 +647,13 @@ impl RpcRequest {
                     Err(jsonrpc_response_success(id, 1584368940.into()))
                 } else {
                     Ok(Self::BlockTime(RpcRequestBlockTime {
+                        x_subscription_id,
                         id: id.into_owned(),
                         slot,
                     }))
                 }
             }
-            "getLatestBlockhash" if state.supported_calls.get_latest_blockhash => {
+            RpcRequestMethod::GetLatestBlockhash => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     #[serde(default)]
@@ -540,9 +674,7 @@ impl RpcRequest {
                     commitment,
                 }))
             }
-            "getRecentPrioritizationFees"
-                if state.supported_calls.get_recent_prioritization_fees =>
-            {
+            RpcRequestMethod::GetRecentPrioritizationFees => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     #[serde(default)]
@@ -607,7 +739,7 @@ impl RpcRequest {
                     },
                 ))
             }
-            "getSignaturesForAddress" if state.supported_calls.get_signatures_for_address => {
+            RpcRequestMethod::GetSignaturesForAddress => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     address: String,
@@ -644,6 +776,7 @@ impl RpcRequest {
                 let id = Self::min_context_check(id, min_context_slot, commitment, state)?;
 
                 Ok(Self::SignaturesForAddress(RpcRequestSignaturesForAddress {
+                    x_subscription_id,
                     id: id.into_owned(),
                     commitment,
                     address,
@@ -652,7 +785,7 @@ impl RpcRequest {
                     limit,
                 }))
             }
-            "getSignatureStatuses" if state.supported_calls.get_signature_statuses => {
+            RpcRequestMethod::GetSignatureStatuses => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     signature_strs: Vec<String>,
@@ -699,12 +832,13 @@ impl RpcRequest {
                 }
 
                 Ok(Self::SignatureStatuses(RpcRequestsSignatureStatuses {
+                    x_subscription_id,
                     id: id.into_owned(),
                     signatures,
                     search_transaction_history,
                 }))
             }
-            "getSlot" if state.supported_calls.get_slot => {
+            RpcRequestMethod::GetSlot => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     #[serde(default)]
@@ -735,7 +869,7 @@ impl RpcRequest {
 
                 Err(jsonrpc_response_success(id, context_slot.into()))
             }
-            "getTransaction" if state.supported_calls.get_transaction => {
+            RpcRequestMethod::GetTransaction => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     signature_str: String,
@@ -767,6 +901,7 @@ impl RpcRequest {
                 }
 
                 Ok(Self::Transaction(RpcRequestTransaction {
+                    x_subscription_id,
                     id: id.into_owned(),
                     signature,
                     commitment,
@@ -774,7 +909,7 @@ impl RpcRequest {
                     max_supported_transaction_version,
                 }))
             }
-            "getVersion" if state.supported_calls.get_version => {
+            RpcRequestMethod::GetVersion => {
                 if let Some(error) = match serde_json::from_str::<serde_json::Value>(
                     request.params.as_ref().map(|p| p.get()).unwrap_or("null"),
                 ) {
@@ -803,7 +938,7 @@ impl RpcRequest {
                     ))
                 }
             }
-            "isBlockhashValid" if state.supported_calls.is_blockhash_valid => {
+            RpcRequestMethod::IsBlockhashValid => {
                 #[derive(Debug, Deserialize)]
                 struct ReqParams {
                     blockhash: String,
@@ -833,7 +968,7 @@ impl RpcRequest {
                     commitment,
                 }))
             }
-            _ => Err(Response {
+            RpcRequestMethod::Unknown => Err(Response {
                 jsonrpc: Some(TwoPointZero),
                 payload: ResponsePayload::error(ErrorCode::MethodNotFound),
                 id: request.id,
@@ -929,21 +1064,6 @@ impl RpcRequest {
         }
     }
 
-    async fn process(self, state: Arc<State>, upstream_disabled: bool) -> RpcRequestResult {
-        match self {
-            Self::Block(request) => request.process(state, upstream_disabled).await,
-            Self::BlockHeight(request) => request.process(state).await,
-            Self::Blocks(request) => request.process(state, upstream_disabled).await,
-            Self::BlockTime(request) => request.process(state, upstream_disabled).await,
-            Self::LatestBlockhash(request) => request.process(state).await,
-            Self::RecentPrioritizationFees(request) => request.process(state).await,
-            Self::SignaturesForAddress(request) => request.process(state, upstream_disabled).await,
-            Self::SignatureStatuses(request) => request.process(state, upstream_disabled).await,
-            Self::Transaction(request) => request.process(state, upstream_disabled).await,
-            Self::IsBlockhashValid(request) => request.process(state).await,
-        }
-    }
-
     async fn process_with_workers(
         state: Arc<State>,
         (mut request, rx): (WorkRequest, oneshot::Receiver<RpcRequestResult>),
@@ -967,6 +1087,7 @@ impl RpcRequest {
 }
 
 struct RpcRequestBlock {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     slot: Slot,
     commitment: CommitmentConfig,
@@ -1001,7 +1122,8 @@ impl RpcRequestBlock {
                 .send(ReadRequest::Block {
                     deadline,
                     slot: self.slot,
-                    tx
+                    tx,
+                    x_subscription_id: Arc::clone(&self.x_subscription_id),
                 })
                 .await
                 .is_ok(),
@@ -1051,6 +1173,7 @@ impl RpcRequestBlock {
         {
             upstream
                 .get_block(
+                    self.x_subscription_id,
                     deadline,
                     &self.id,
                     self.slot,
@@ -1080,11 +1203,8 @@ impl RpcRequestBlock {
 }
 
 pub struct RpcRequestBlockWorkRequest {
+    request: RpcRequestBlock,
     bytes: Vec<u8>,
-    id: Id<'static>,
-    slot: Slot,
-    encoding: UiTransactionEncoding,
-    encoding_options: BlockEncodingOptions,
     tx: Option<oneshot::Sender<RpcRequestResult>>,
 }
 
@@ -1095,11 +1215,8 @@ impl RpcRequestBlockWorkRequest {
     ) -> (WorkRequest, oneshot::Receiver<RpcRequestResult>) {
         let (tx, rx) = oneshot::channel();
         let this = Self {
+            request,
             bytes,
-            id: request.id,
-            slot: request.slot,
-            encoding: request.encoding,
-            encoding_options: request.encoding_options,
             tx: Some(tx),
         };
         (WorkRequest::Block(this), rx)
@@ -1107,36 +1224,51 @@ impl RpcRequestBlockWorkRequest {
 
     pub fn process(mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(self.process2());
+            let ts = quanta::Instant::now();
+            let _ = tx.send(Self::process2(
+                self.bytes,
+                self.request.id,
+                self.request.slot,
+                self.request.encoding,
+                self.request.encoding_options,
+            ));
+            gauge!(
+                RPC_WORKERS_CPU_SECONDS_TOTAL,
+                "x_subscription_id" => self.request.x_subscription_id,
+                "method" => "getBlock"
+            )
+            .increment(duration_to_seconds(ts.elapsed()));
         }
     }
 
-    fn process2(self) -> RpcRequestResult {
+    fn process2(
+        bytes: Vec<u8>,
+        id: Id<'static>,
+        slot: Slot,
+        encoding: UiTransactionEncoding,
+        encoding_options: BlockEncodingOptions,
+    ) -> RpcRequestResult {
         // parse
-        let block = match generated::ConfirmedBlock::decode(self.bytes.as_ref()) {
+        let block = match generated::ConfirmedBlock::decode(bytes.as_ref()) {
             Ok(block) => match ConfirmedBlock::try_from(block) {
                 Ok(block) => block,
                 Err(error) => {
-                    error!(self.slot, ?error, "failed to decode block");
+                    error!(slot, ?error, "failed to decode block");
                     anyhow::bail!("failed to decode block")
                 }
             },
             Err(error) => {
-                error!(
-                    self.slot,
-                    ?error,
-                    "failed to decode block protobuf / bincode"
-                );
+                error!(slot, ?error, "failed to decode block protobuf / bincode");
                 anyhow::bail!("failed to decode block protobuf / bincode")
             }
         };
 
         // encode
-        let block = match block.encode_with_options(self.encoding, self.encoding_options) {
+        let block = match block.encode_with_options(encoding, encoding_options) {
             Ok(block) => block,
             Err(error) => {
                 return Ok(jsonrpc_response_error_custom(
-                    self.id,
+                    id,
                     RpcCustomError::from(error),
                 ));
             }
@@ -1145,7 +1277,7 @@ impl RpcRequestBlockWorkRequest {
         // serialize
         let data = serde_json::to_value(&block).expect("json serialization never fail");
 
-        Ok(jsonrpc_response_success(self.id, data))
+        Ok(jsonrpc_response_success(id, data))
     }
 }
 
@@ -1196,6 +1328,7 @@ pub enum RpcRequestBlocksUntil {
 
 #[derive(Debug)]
 struct RpcRequestBlocks {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     start_slot: Slot,
     until: RpcRequestBlocksUntil,
@@ -1259,6 +1392,7 @@ impl RpcRequestBlocks {
             Some(
                 upstream
                     .get_blocks(
+                        Arc::clone(&self.x_subscription_id),
                         deadline,
                         &self.id,
                         self.start_slot,
@@ -1275,6 +1409,7 @@ impl RpcRequestBlocks {
 
 #[derive(Debug)]
 struct RpcRequestBlockTime {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     slot: Slot,
 }
@@ -1331,7 +1466,9 @@ impl RpcRequestBlockTime {
             .then_some(state.upstream.as_ref())
             .flatten()
         {
-            upstream.get_block_time(deadline, &self.id, self.slot).await
+            upstream
+                .get_block_time(self.x_subscription_id, deadline, &self.id, self.slot)
+                .await
         } else {
             Ok(jsonrpc_response_success(
                 self.id,
@@ -1435,6 +1572,7 @@ impl RpcRequestRecentPrioritizationFees {
 
 #[derive(Debug)]
 struct RpcRequestSignaturesForAddress {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     commitment: CommitmentConfig,
     address: Pubkey,
@@ -1460,6 +1598,7 @@ impl RpcRequestSignaturesForAddress {
                     until: self.until,
                     limit: self.limit,
                     tx,
+                    x_subscription_id: Arc::clone(&self.x_subscription_id),
                 })
                 .await
                 .is_ok(),
@@ -1481,7 +1620,7 @@ impl RpcRequestSignaturesForAddress {
         };
 
         let limit = self.limit - signatures.len();
-        if !finished && !upstream_disabled && limit > 0 {
+        let id = if !finished && !upstream_disabled && limit > 0 {
             if !signatures.is_empty() {
                 before = signatures
                     .last()
@@ -1489,30 +1628,36 @@ impl RpcRequestSignaturesForAddress {
             }
 
             match self.fetch_upstream(state, deadline, before, limit).await? {
-                Ok(mut sigs) => signatures.append(&mut sigs),
+                Ok((id, mut sigs)) => {
+                    signatures.append(&mut sigs);
+                    id
+                }
                 Err(error) => return Ok(error),
             }
-        }
+        } else {
+            self.id
+        };
 
         let data = serde_json::to_value(&signatures).expect("json serialization never fail");
-        Ok(jsonrpc_response_success(self.id, data))
+        Ok(jsonrpc_response_success(id, data))
     }
 
     async fn fetch_upstream(
-        &self,
+        self,
         state: Arc<State>,
         deadline: Instant,
         before: Option<Signature>,
         limit: usize,
     ) -> anyhow::Result<
         Result<
-            Vec<RpcConfirmedTransactionStatusWithSignature>,
+            (Id<'static>, Vec<RpcConfirmedTransactionStatusWithSignature>),
             Response<'static, serde_json::Value>,
         >,
     > {
         if let Some(upstream) = state.upstream.as_ref() {
             let response = upstream
                 .get_signatures_for_address(
+                    self.x_subscription_id,
                     deadline,
                     &self.id,
                     self.address,
@@ -1532,15 +1677,16 @@ impl RpcRequestSignaturesForAddress {
             };
             serde_json::from_value(value.into_owned())
                 .context("failed to parse upstream response")
-                .map(Ok)
+                .map(|vec| Ok((self.id, vec)))
         } else {
-            Ok(Ok(vec![]))
+            Ok(Ok((self.id, vec![])))
         }
     }
 }
 
 #[derive(Debug)]
 struct RpcRequestsSignatureStatuses {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     signatures: Vec<Signature>,
     search_transaction_history: bool,
@@ -1559,7 +1705,8 @@ impl RpcRequestsSignatureStatuses {
                     deadline,
                     signatures: self.signatures.clone(),
                     search_transaction_history: self.search_transaction_history,
-                    tx
+                    tx,
+                    x_subscription_id: Arc::clone(&self.x_subscription_id),
                 })
                 .await
                 .is_ok(),
@@ -1622,7 +1769,12 @@ impl RpcRequestsSignatureStatuses {
     {
         if let Some(upstream) = state.upstream.as_ref() {
             let response = upstream
-                .get_signature_statuses(deadline, &self.id, signatures)
+                .get_signature_statuses(
+                    Arc::clone(&self.x_subscription_id),
+                    deadline,
+                    &self.id,
+                    signatures,
+                )
                 .await?;
 
             if let ResponsePayload::Error(_) = &response.payload {
@@ -1641,7 +1793,9 @@ impl RpcRequestsSignatureStatuses {
     }
 }
 
+#[derive(Debug)]
 struct RpcRequestTransaction {
+    x_subscription_id: Arc<str>,
     id: Id<'static>,
     signature: Signature,
     commitment: CommitmentConfig,
@@ -1661,7 +1815,8 @@ impl RpcRequestTransaction {
                 .send(ReadRequest::Transaction {
                     deadline,
                     signature: self.signature,
-                    tx
+                    tx,
+                    x_subscription_id: Arc::clone(&self.x_subscription_id),
                 })
                 .await
                 .is_ok(),
@@ -1720,6 +1875,7 @@ impl RpcRequestTransaction {
         {
             upstream
                 .get_transaction(
+                    self.x_subscription_id,
                     deadline,
                     &self.id,
                     self.signature,
@@ -1739,12 +1895,10 @@ impl RpcRequestTransaction {
 
 #[derive(Debug)]
 pub struct RpcRequestTransactionWorkRequest {
+    request: RpcRequestTransaction,
     slot: Slot,
     block_time: Option<UnixTimestamp>,
     bytes: Vec<u8>,
-    id: Id<'static>,
-    encoding: UiTransactionEncoding,
-    max_supported_transaction_version: Option<u8>,
     tx: Option<oneshot::Sender<RpcRequestResult>>,
 }
 
@@ -1757,12 +1911,10 @@ impl RpcRequestTransactionWorkRequest {
     ) -> (WorkRequest, oneshot::Receiver<RpcRequestResult>) {
         let (tx, rx) = oneshot::channel();
         let this = Self {
+            request,
             slot,
             block_time,
             bytes,
-            id: request.id,
-            encoding: request.encoding,
-            max_supported_transaction_version: request.max_supported_transaction_version,
             tx: Some(tx),
         };
         (WorkRequest::Transaction(this), rx)
@@ -1770,23 +1922,44 @@ impl RpcRequestTransactionWorkRequest {
 
     pub fn process(mut self) {
         if let Some(tx) = self.tx.take() {
-            let _ = tx.send(self.process2());
+            let ts = quanta::Instant::now();
+            let _ = tx.send(Self::process2(
+                self.bytes,
+                self.slot,
+                self.block_time,
+                self.request.id,
+                self.request.encoding,
+                self.request.max_supported_transaction_version,
+            ));
+            gauge!(
+                RPC_WORKERS_CPU_SECONDS_TOTAL,
+                "x_subscription_id" => self.request.x_subscription_id,
+                "method" => "getTransaction"
+            )
+            .increment(duration_to_seconds(ts.elapsed()));
         }
     }
 
-    fn process2(self) -> RpcRequestResult {
+    fn process2(
+        bytes: Vec<u8>,
+        slot: Slot,
+        block_time: Option<UnixTimestamp>,
+        id: Id<'static>,
+        encoding: UiTransactionEncoding,
+        max_supported_transaction_version: Option<u8>,
+    ) -> RpcRequestResult {
         // parse
-        let tx_with_meta = match generated::ConfirmedTransaction::decode(self.bytes.as_ref()) {
+        let tx_with_meta = match generated::ConfirmedTransaction::decode(bytes.as_ref()) {
             Ok(tx) => match TransactionWithStatusMeta::try_from(tx) {
                 Ok(tx_with_meta) => tx_with_meta,
                 Err(error) => {
-                    error!(self.slot, ?error, "failed to decode transaction");
+                    error!(slot, ?error, "failed to decode transaction");
                     anyhow::bail!("failed to decode transaction")
                 }
             },
             Err(error) => {
                 error!(
-                    self.slot,
+                    slot,
                     ?error,
                     "failed to decode transaction protobuf / bincode"
                 );
@@ -1796,15 +1969,15 @@ impl RpcRequestTransactionWorkRequest {
 
         // encode
         let confirmed_tx = ConfirmedTransactionWithStatusMeta {
-            slot: self.slot,
+            slot,
             tx_with_meta,
-            block_time: self.block_time,
+            block_time,
         };
-        let tx = match confirmed_tx.encode(self.encoding, self.max_supported_transaction_version) {
+        let tx = match confirmed_tx.encode(encoding, max_supported_transaction_version) {
             Ok(tx) => tx,
             Err(error) => {
                 return Ok(jsonrpc_response_error_custom(
-                    self.id,
+                    id,
                     RpcCustomError::from(error),
                 ));
             }
@@ -1813,7 +1986,7 @@ impl RpcRequestTransactionWorkRequest {
         // serialize
         let data = serde_json::to_value(&tx).expect("json serialization never fail");
 
-        Ok(jsonrpc_response_success(self.id, data))
+        Ok(jsonrpc_response_success(id, data))
     }
 }
 

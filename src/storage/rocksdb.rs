@@ -52,7 +52,7 @@ impl ColumnName for SlotBasicIndex {
 }
 
 impl SlotBasicIndex {
-    pub fn key(slot: Slot) -> [u8; 8] {
+    pub const fn key(slot: Slot) -> [u8; 8] {
         slot.to_be_bytes()
     }
 
@@ -155,7 +155,7 @@ impl ColumnName for SlotExtraIndex {
 }
 
 impl SlotExtraIndex {
-    pub fn key(slot: Slot) -> [u8; 8] {
+    pub const fn key(slot: Slot) -> [u8; 8] {
         slot.to_be_bytes()
     }
 
@@ -984,7 +984,7 @@ impl RocksdbRead {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn read_signatures_for_address(
+    pub fn read_sfa_index(
         &self,
         address: Pubkey,
         slot: Slot,
@@ -1012,7 +1012,7 @@ impl RocksdbRead {
     }
 
     #[allow(clippy::type_complexity)]
-    pub fn read_signature_statuses(
+    pub fn read_signature_statuses_index(
         &self,
         signatures: Vec<Signature>,
     ) -> anyhow::Result<

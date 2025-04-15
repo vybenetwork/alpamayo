@@ -1,33 +1,73 @@
 use {
     crate::{
-        metrics,
+        metrics::STORAGE_STORED_SLOTS,
         util::{HashMap, HashSet},
     },
-    solana_sdk::{clock::Slot, commitment_config::CommitmentLevel},
-    std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+    metrics::{Gauge, gauge},
+    solana_sdk::clock::Slot,
+    std::{
+        ops::Deref,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        },
     },
 };
 
-#[derive(Debug, Clone)]
-pub struct StoredSlots {
-    processed: Arc<AtomicU64>,
-    confirmed: Arc<AtomicU64>,
-    finalized: Arc<AtomicU64>,
-    first_available: Arc<AtomicU64>,
-    max_recent_blockhashes: Arc<AtomicBool>,
+#[derive(Debug)]
+struct Metrics {
+    processed: Gauge,
+    confirmed: Gauge,
+    finalized: Gauge,
+    first_available: Gauge,
+    total: Gauge,
 }
 
-impl Default for StoredSlots {
+impl Default for Metrics {
     fn default() -> Self {
         Self {
-            processed: Arc::new(AtomicU64::new(u64::MIN)),
-            confirmed: Arc::new(AtomicU64::new(u64::MIN)),
-            finalized: Arc::new(AtomicU64::new(u64::MIN)),
-            first_available: Arc::new(AtomicU64::new(u64::MAX)),
-            max_recent_blockhashes: Arc::new(AtomicBool::new(false)),
+            processed: gauge!(STORAGE_STORED_SLOTS, "type" => "processed"),
+            confirmed: gauge!(STORAGE_STORED_SLOTS, "type" => "confirmed"),
+            finalized: gauge!(STORAGE_STORED_SLOTS, "type" => "finalized"),
+            first_available: gauge!(STORAGE_STORED_SLOTS, "type" => "first_available"),
+            total: gauge!(STORAGE_STORED_SLOTS, "type" => "total"),
         }
+    }
+}
+
+#[derive(Debug)]
+pub struct StoredSlotsInner {
+    processed: AtomicU64,
+    confirmed: AtomicU64,
+    finalized: AtomicU64,
+    first_available: AtomicU64,
+    max_recent_blockhashes: AtomicBool,
+    metrics: Metrics,
+}
+
+impl Default for StoredSlotsInner {
+    fn default() -> Self {
+        Self {
+            processed: AtomicU64::new(u64::MIN),
+            confirmed: AtomicU64::new(u64::MIN),
+            finalized: AtomicU64::new(u64::MIN),
+            first_available: AtomicU64::new(u64::MAX),
+            max_recent_blockhashes: AtomicBool::new(false),
+            metrics: Metrics::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct StoredSlots {
+    inner: Arc<StoredSlotsInner>,
+}
+
+impl Deref for StoredSlots {
+    type Target = StoredSlotsInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
     }
 }
 
@@ -46,7 +86,7 @@ impl StoredSlots {
 
     pub fn processed_store(&self, slot: Slot) {
         self.processed.store(slot, Ordering::SeqCst);
-        metrics::storage_stored_slots_set_commitment(slot, CommitmentLevel::Processed);
+        self.metrics.processed.set(slot as f64);
     }
 
     pub fn confirmed_load(&self) -> Slot {
@@ -55,7 +95,7 @@ impl StoredSlots {
 
     pub fn confirmed_store(&self, slot: Slot) {
         self.confirmed.store(slot, Ordering::SeqCst);
-        metrics::storage_stored_slots_set_commitment(slot, CommitmentLevel::Confirmed);
+        self.metrics.confirmed.set(slot as f64);
     }
 
     pub fn finalized_load(&self) -> Slot {
@@ -64,7 +104,7 @@ impl StoredSlots {
 
     pub fn finalized_store(&self, slot: Slot) {
         self.finalized.store(slot, Ordering::Relaxed);
-        metrics::storage_stored_slots_set_commitment(slot, CommitmentLevel::Finalized);
+        self.metrics.finalized.set(slot as f64);
     }
 
     pub fn first_available_load(&self) -> Slot {
@@ -74,7 +114,11 @@ impl StoredSlots {
     pub fn first_available_store(&self, slot: Option<Slot>) {
         let slot = slot.unwrap_or(u64::MAX);
         self.first_available.store(slot, Ordering::SeqCst);
-        metrics::storage_stored_slots_set_first_available(slot);
+        self.metrics.first_available.set(slot as f64);
+    }
+
+    pub fn set_total(&self, total: usize) {
+        self.metrics.total.set(total as f64);
     }
 }
 

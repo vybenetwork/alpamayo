@@ -177,7 +177,7 @@ pub struct ConfigStorageFile {
     pub size: u64,
 }
 
-#[derive(Debug, Default, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigStorageRocksdb {
     pub path: PathBuf,
@@ -259,7 +259,7 @@ impl Default for ConfigStorageRead {
         Self {
             threads: 2,
             affinity: None,
-            requests_concurrency: 256,
+            requests_concurrency: 128,
         }
     }
 }
