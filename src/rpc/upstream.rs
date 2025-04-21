@@ -3,8 +3,8 @@ use {
         config::ConfigRpcUpstream,
         metrics::RPC_UPSTREAM_REQUESTS_TOTAL,
         rpc::{
-            api::{RpcResponse, X_ERROR, X_SLOT, X_SUBSCRIPTION_ID},
-            api_solana::RpcRequestBlocksUntil,
+            api::{X_ERROR, X_SLOT},
+            api_jsonrpc::RpcRequestBlocksUntil,
         },
     },
     http_body_util::{BodyExt, Full as BodyFull},
@@ -12,6 +12,7 @@ use {
     jsonrpsee_types::{Id, Response},
     metrics::counter,
     reqwest::{Client, StatusCode, Version, header::CONTENT_TYPE},
+    richat_shared::jsonrpc::helpers::{RpcResponse, X_SUBSCRIPTION_ID},
     serde_json::json,
     solana_rpc_client_api::config::{
         RpcBlockConfig, RpcSignatureStatusConfig, RpcSignaturesForAddressConfig,
@@ -27,13 +28,13 @@ use {
 };
 
 #[derive(Debug)]
-pub struct RpcClientRest {
+pub struct RpcClientHttpget {
     client: Client,
     url: Url,
     version: Version,
 }
 
-impl RpcClientRest {
+impl RpcClientHttpget {
     pub fn new(config: ConfigRpcUpstream) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(config.user_agent)

@@ -1,7 +1,7 @@
 use {
     crate::{
         config::ConfigRpc,
-        rpc::{api_rest, api_solana, workers},
+        rpc::{api_httpget, api_jsonrpc, workers},
         storage::{read::ReadRequest, slots::StoredSlots},
     },
     futures::future::{TryFutureExt, ready},
@@ -28,12 +28,12 @@ pub async fn spawn(
     let listener = TcpListener::bind(config.endpoint).await?;
     info!("start server at: {}", config.endpoint);
 
-    let api_rest_state = Arc::new(api_rest::State::new(
+    let api_httpget_state = Arc::new(api_httpget::State::new(
         &config,
         stored_slots.clone(),
         requests_tx.clone(),
     )?);
-    let api_solana_state = Arc::new(api_solana::State::new(
+    let api_jsonrpc_processor = Arc::new(api_jsonrpc::create_request_processor(
         config,
         stored_slots,
         requests_tx,
@@ -61,19 +61,19 @@ pub async fn spawn(
             };
 
             let service = service_fn({
-                let api_rest_state = Arc::clone(&api_rest_state);
-                let api_solana_state = Arc::clone(&api_solana_state);
+                let api_httpget_state = Arc::clone(&api_httpget_state);
+                let api_jsonrpc_processor = Arc::clone(&api_jsonrpc_processor);
                 move |req: Request<BodyIncoming>| {
-                    let api_rest_state = Arc::clone(&api_rest_state);
-                    let api_solana_state = Arc::clone(&api_solana_state);
+                    let api_httpget_state = Arc::clone(&api_httpget_state);
+                    let api_jsonrpc_processor = Arc::clone(&api_jsonrpc_processor);
                     async move {
                         // JSON-RPC
                         if req.uri().path() == "/" {
-                            return api_solana::on_request(req, api_solana_state).await;
+                            return api_jsonrpc_processor.on_request(req).await;
                         }
 
-                        // Rest (GET)
-                        if let Some(handler) = api_rest_state.get_handler(req) {
+                        // Http/Get
+                        if let Some(handler) = api_httpget_state.get_handler(req) {
                             return handler.await;
                         }
 

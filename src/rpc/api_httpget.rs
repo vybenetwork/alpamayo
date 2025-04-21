@@ -1,13 +1,9 @@
 use {
     crate::{
-        config::{ConfigRpc, ConfigRpcCallRest},
-        metrics::RPC_REQUESTS_TOTAL,
+        config::{ConfigRpc, ConfigRpcCallHttpGet},
         rpc::{
-            api::{
-                RpcResponse, X_SLOT, check_call_support, get_x_bigtable_disabled,
-                get_x_subscription_id, response_200, response_400, response_500,
-            },
-            upstream::RpcClientRest,
+            api::{X_ERROR, X_SLOT, check_call_support},
+            upstream::RpcClientHttpget,
         },
         storage::{
             read::{ReadRequest, ReadResultBlock, ReadResultTransaction},
@@ -17,9 +13,19 @@ use {
     },
     futures::future::BoxFuture,
     http_body_util::{BodyExt, Full as BodyFull},
-    hyper::{body::Incoming as BodyIncoming, http::Result as HttpResult},
+    hyper::{
+        StatusCode,
+        body::{Body, Bytes, Incoming as BodyIncoming},
+        http::Result as HttpResult,
+    },
     metrics::counter,
     regex::Regex,
+    richat_shared::jsonrpc::{
+        helpers::{
+            RpcResponse, get_x_bigtable_disabled, get_x_subscription_id, response_200, response_500,
+        },
+        metrics::RPC_REQUESTS_TOTAL,
+    },
     solana_sdk::{clock::Slot, signature::Signature},
     std::{
         str::FromStr,
@@ -36,12 +42,12 @@ struct SupportedCalls {
 }
 
 impl SupportedCalls {
-    fn new(calls: &[ConfigRpcCallRest]) -> anyhow::Result<Self> {
+    fn new(calls: &[ConfigRpcCallHttpGet]) -> anyhow::Result<Self> {
         Ok(Self {
-            get_block: check_call_support(calls, ConfigRpcCallRest::GetBlock)?
+            get_block: check_call_support(calls, ConfigRpcCallHttpGet::GetBlock)?
                 .then(|| Regex::new(r"^/block/(\d{1,9})/?$"))
                 .transpose()?,
-            get_transaction: check_call_support(calls, ConfigRpcCallRest::GetTransaction)?
+            get_transaction: check_call_support(calls, ConfigRpcCallHttpGet::GetTransaction)?
                 .then(|| Regex::new(r"^/tx/([1-9A-HJ-NP-Za-km-z]{64,88})/?$"))
                 .transpose()?,
         })
@@ -54,7 +60,7 @@ pub struct State {
     request_timeout: Duration,
     supported_calls: SupportedCalls,
     requests_tx: mpsc::Sender<ReadRequest>,
-    upstream: Option<RpcClientRest>,
+    upstream: Option<RpcClientHttpget>,
 }
 
 impl State {
@@ -66,12 +72,12 @@ impl State {
         Ok(Self {
             stored_slots,
             request_timeout: config.request_timeout,
-            supported_calls: SupportedCalls::new(&config.calls_rest)?,
+            supported_calls: SupportedCalls::new(&config.calls_httpget)?,
             requests_tx,
             upstream: config
-                .upstream_rest
+                .upstream_httpget
                 .clone()
-                .map(RpcClientRest::new)
+                .map(RpcClientHttpget::new)
                 .transpose()?,
         })
     }
@@ -215,20 +221,20 @@ impl State {
 
     fn block_error_not_available(slot: Slot) -> anyhow::Result<HttpResult<RpcResponse>> {
         let msg = format!("Block not available for slot {slot}\n");
-        Ok(response_400(msg, Some("BlockNotAvailable".into())))
+        Ok(response_400(msg, "BlockNotAvailable".into()))
     }
 
     fn block_error_skipped(slot: Slot) -> anyhow::Result<HttpResult<RpcResponse>> {
         let msg =
             format!("Slot {slot} was skipped, or missing due to ledger jump to recent snapshot\n");
-        Ok(response_400(msg, Some("SlotSkipped".into())))
+        Ok(response_400(msg, "SlotSkipped".into()))
     }
 
     fn block_error_skipped_long_term_storage(
         slot: Slot,
     ) -> anyhow::Result<HttpResult<RpcResponse>> {
         let msg = format!("Slot {slot} was skipped, or missing in long-term storage\n");
-        Ok(response_400(msg, Some("LongTermStorageSlotSkipped".into())))
+        Ok(response_400(msg, "LongTermStorageSlotSkipped".into()))
     }
 
     async fn process_transaction(
@@ -318,9 +324,17 @@ impl State {
 
     fn transaction_error_history_not_available() -> anyhow::Result<HttpResult<RpcResponse>> {
         let msg = "Transaction history is not available from this node\n".to_owned();
-        Ok(response_400(
-            msg,
-            Some("TransactionHistoryNotAvailable".into()),
-        ))
+        Ok(response_400(msg, "TransactionHistoryNotAvailable".into()))
     }
+}
+
+fn response_400<B>(body: B, x_error: Vec<u8>) -> HttpResult<RpcResponse>
+where
+    B: BodyExt + Send + Sync + 'static,
+    B: Body<Data = Bytes, Error = std::convert::Infallible>,
+{
+    hyper::Response::builder()
+        .header(X_ERROR, x_error)
+        .status(StatusCode::BAD_REQUEST)
+        .body(body.boxed())
 }
