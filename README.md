@@ -10,6 +10,8 @@ Please use issues only for reporting bugs or discussing feature-related topics. 
 
 ### Solana Rpc methods:
 
+#### Blocks based
+
 - [x] `getBlock`
 - [x] `getBlockHeight`
 - [x] `getBlocks`
@@ -22,8 +24,16 @@ Please use issues only for reporting bugs or discussing feature-related topics. 
 - [x] `getSignatureStatuses`
 - [x] `getSlot`
 - [x] `getTransaction`
-- [x] `getVersion`
 - [x] `isBlockhashValid`
+
+#### Smart cache
+
+- [x] `getClusterNodes`
+- [x] `getLeaderSchedule`
+
+#### Static
+
+- [x] `getVersion`
 
 ### Extra methods:
 

@@ -1,8 +1,8 @@
 use {
     crate::{
         config::{ConfigRpc, ConfigRpcCallJson},
-        metrics::{RPC_WORKERS_CPU_SECONDS_TOTAL, duration_to_seconds},
-        rpc::{api::check_call_support, upstream::RpcClientJsonrpc, workers::WorkRequest},
+        metrics::RPC_WORKERS_CPU_SECONDS_TOTAL,
+        rpc::{upstream::RpcClientJsonrpc, workers::WorkRequest},
         storage::{
             read::{
                 ReadRequest, ReadResultBlock, ReadResultBlockHeight, ReadResultBlockTime,
@@ -22,18 +22,23 @@ use {
     },
     metrics::gauge,
     prost::Message,
-    richat_shared::jsonrpc::{
-        helpers::{
-            jsonrpc_error_invalid_params, jsonrpc_response_error, jsonrpc_response_error_custom,
-            jsonrpc_response_success,
+    richat_shared::{
+        jsonrpc::{
+            helpers::{
+                jsonrpc_error_invalid_params, jsonrpc_response_error,
+                jsonrpc_response_error_custom, jsonrpc_response_success,
+            },
+            requests::{RpcRequestResult, RpcRequestsProcessor},
         },
-        requests::{RpcRequestResult, RpcRequestsProcessor},
+        metrics::duration_to_seconds,
     },
     serde::{Deserialize, Serialize, de},
+    serde_json::json,
     solana_rpc_client_api::{
         config::{
             RpcBlockConfig, RpcBlocksConfigWrapper, RpcContextConfig, RpcEncodingConfigWrapper,
-            RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcTransactionConfig,
+            RpcLeaderScheduleConfig, RpcLeaderScheduleConfigWrapper, RpcSignatureStatusConfig,
+            RpcSignaturesForAddressConfig, RpcTransactionConfig,
         },
         custom_error::RpcCustomError,
         request::{MAX_GET_CONFIRMED_BLOCKS_RANGE, MAX_GET_SIGNATURE_STATUSES_QUERY_ITEMS},
@@ -45,6 +50,7 @@ use {
     solana_sdk::{
         clock::{Slot, UnixTimestamp},
         commitment_config::{CommitmentConfig, CommitmentLevel},
+        epoch_schedule::EpochSchedule,
         hash::Hash,
         pubkey::Pubkey,
         signature::Signature,
@@ -56,6 +62,7 @@ use {
         TransactionStatus, TransactionWithStatusMeta, UiTransactionEncoding,
     },
     std::{
+        collections::HashSet,
         future::Future,
         str::FromStr,
         sync::Arc,
@@ -76,6 +83,7 @@ pub struct RpcRecentPrioritizationFeesConfig {
 
 #[derive(Debug)]
 pub struct State {
+    epoch_schedule: EpochSchedule,
     stored_slots: StoredSlots,
     request_timeout: Duration,
     gsfa_limit: usize,
@@ -93,17 +101,35 @@ impl State {
         requests_tx: mpsc::Sender<ReadRequest>,
         workers: Sender<WorkRequest>,
     ) -> anyhow::Result<Self> {
+        let upstream = config
+            .upstream_jsonrpc
+            .map(|config_upstream| RpcClientJsonrpc::new(config_upstream, config.cache_ttl))
+            .transpose()?;
+
+        if config
+            .calls_jsonrpc
+            .intersection(&HashSet::from([
+                ConfigRpcCallJson::GetClusterNodes,
+                ConfigRpcCallJson::GetLeaderSchedule,
+            ]))
+            .next()
+            .is_some()
+        {
+            anyhow::ensure!(
+                upstream.is_some(),
+                "upstream required for cached methods like `getClusterNodes`"
+            );
+        }
+
         Ok(Self {
+            epoch_schedule: EpochSchedule::without_warmup(),
             stored_slots,
             request_timeout: config.request_timeout,
             gsfa_limit: config.gsfa_limit,
             gss_transaction_history: config.gss_transaction_history,
             grpf_percentile: config.grpf_percentile,
             requests_tx,
-            upstream: config
-                .upstream_jsonrpc
-                .map(RpcClientJsonrpc::new)
-                .transpose()?,
+            upstream,
             workers,
         })
     }
@@ -119,64 +145,73 @@ pub fn create_request_processor(
     let mut processor = RpcRequestsProcessor::new(config.body_limit, Arc::new(state));
 
     let calls = &config.calls_jsonrpc;
-    if check_call_support(calls, ConfigRpcCallJson::GetBlock)? {
+    if calls.contains(&ConfigRpcCallJson::GetBlock) {
         processor.add_handler("getBlock", Box::new(RpcRequestBlock::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetBlockHeight)? {
+    if calls.contains(&ConfigRpcCallJson::GetBlockHeight) {
         processor.add_handler("getBlockHeight", Box::new(RpcRequestBlockHeight::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetBlocks)? {
+    if calls.contains(&ConfigRpcCallJson::GetBlocks) {
         processor.add_handler("getBlocks", Box::new(RpcRequestBlocks::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetBlocksWithLimit)? {
+    if calls.contains(&ConfigRpcCallJson::GetBlocksWithLimit) {
         processor.add_handler(
             "getBlocksWithLimit",
             Box::new(RpcRequestBlocksWithLimit::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetBlockTime)? {
+    if calls.contains(&ConfigRpcCallJson::GetBlockTime) {
         processor.add_handler("getBlockTime", Box::new(RpcRequestBlockTime::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetFirstAvailableBlock)? {
+    if calls.contains(&ConfigRpcCallJson::GetClusterNodes) {
+        processor.add_handler("getClusterNodes", Box::new(RpcRequestClusterNodes::handle));
+    }
+    if calls.contains(&ConfigRpcCallJson::GetFirstAvailableBlock) {
         processor.add_handler(
             "getFirstAvailableBlock",
             Box::new(RpcRequestFirstAvailableBlock::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetLatestBlockhash)? {
+    if calls.contains(&ConfigRpcCallJson::GetLatestBlockhash) {
         processor.add_handler(
             "getLatestBlockhash",
             Box::new(RpcRequestLatestBlockhash::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetRecentPrioritizationFees)? {
+    if calls.contains(&ConfigRpcCallJson::GetLeaderSchedule) {
+        processor.add_handler(
+            "getLeaderSchedule",
+            Box::new(RpcRequestLeaderSchedule::handle),
+        );
+    }
+    if calls.contains(&ConfigRpcCallJson::GetRecentPrioritizationFees) {
         processor.add_handler(
             "getRecentPrioritizationFees",
             Box::new(RpcRequestRecentPrioritizationFees::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetSignaturesForAddress)? {
+    if calls.contains(&ConfigRpcCallJson::GetSignaturesForAddress) {
         processor.add_handler(
             "getSignaturesForAddress",
             Box::new(RpcRequestSignaturesForAddress::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetSignatureStatuses)? {
+    if calls.contains(&ConfigRpcCallJson::GetSignatureStatuses) {
         processor.add_handler(
             "getSignatureStatuses",
             Box::new(RpcRequestSignatureStatuses::handle),
         );
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetSlot)? {
+    if calls.contains(&ConfigRpcCallJson::GetSlot) {
         processor.add_handler("getSlot", Box::new(RpcRequestSlot::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetTransaction)? {
+    if calls.contains(&ConfigRpcCallJson::GetTransaction) {
         processor.add_handler("getTransaction", Box::new(RpcRequestTransaction::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::GetVersion)? {
+    if calls.contains(&ConfigRpcCallJson::GetVersion) {
         processor.add_handler("getVersion", Box::new(RpcRequestVersion::handle));
     }
-    if check_call_support(calls, ConfigRpcCallJson::IsBlockhashValid)? {
+    if calls.contains(&ConfigRpcCallJson::IsBlockhashValid) {
         processor.add_handler(
             "isBlockhashValid",
             Box::new(RpcRequestIsBlockhashValid::handle),
@@ -657,10 +692,7 @@ impl RpcRequestHandler for RpcRequestBlockHeight {
             ReadResultBlockHeight::BlockHeight(block_height) => block_height,
             ReadResultBlockHeight::ReadError(error) => anyhow::bail!("read error: {error}"),
         };
-        Ok(jsonrpc_response_success(
-            self.id,
-            serde_json::json!(block_height),
-        ))
+        Ok(jsonrpc_response_success(self.id, json!(block_height)))
     }
 }
 
@@ -733,7 +765,7 @@ impl RpcRequestHandler for RpcRequestBlocks {
             },
         );
         if end_slot < start_slot {
-            return Err(jsonrpc_response_success(id, serde_json::json!([])));
+            return Err(jsonrpc_response_success(id, json!([])));
         }
         if end_slot - start_slot > MAX_GET_CONFIRMED_BLOCKS_RANGE {
             return Err(jsonrpc_response_error(
@@ -862,7 +894,7 @@ impl RpcRequestHandler for RpcRequestBlocksWithLimit {
         }
 
         if limit == 0 {
-            return Err(jsonrpc_response_success(id, serde_json::json!([])));
+            return Err(jsonrpc_response_success(id, json!([])));
         }
         if limit > MAX_GET_CONFIRMED_BLOCKS_RANGE as usize {
             return Err(jsonrpc_response_error(
@@ -986,11 +1018,43 @@ impl RpcRequestBlockTime {
                 .get_block_time(self.x_subscription_id, deadline, &self.id, self.slot)
                 .await
         } else {
-            Ok(jsonrpc_response_success(
-                self.id,
-                serde_json::json!(None::<()>),
-            ))
+            Ok(jsonrpc_response_success(self.id, json!(None::<()>)))
         }
+    }
+}
+
+#[derive(Debug)]
+struct RpcRequestClusterNodes {
+    state: Arc<State>,
+    x_subscription_id: Arc<str>,
+    id: Id<'static>,
+}
+
+impl RpcRequestHandler for RpcRequestClusterNodes {
+    fn parse(
+        state: Arc<State>,
+        x_subscription_id: Arc<str>,
+        _upstream_disabled: bool,
+        request: Request<'_>,
+    ) -> Result<Self, Response<'_, serde_json::Value>> {
+        let request = no_params_expected(request)?;
+        Ok(Self {
+            state,
+            x_subscription_id,
+            id: request.id.into_owned(),
+        })
+    }
+
+    async fn process(self) -> RpcRequestResult<'static> {
+        let deadline = Instant::now() + self.state.request_timeout;
+
+        let Some(upstream) = self.state.upstream.as_ref() else {
+            unreachable!();
+        };
+
+        upstream
+            .get_cluster_nodes(self.x_subscription_id, deadline, self.id)
+            .await
     }
 }
 
@@ -1031,7 +1095,7 @@ impl RpcRequestHandler for RpcRequestFirstAvailableBlock {
         } else {
             Ok(jsonrpc_response_success(
                 self.id,
-                serde_json::json!(self.state.stored_slots.first_available_load()),
+                json!(self.state.stored_slots.first_available_load()),
             ))
         }
     }
@@ -1115,6 +1179,87 @@ impl RpcRequestHandler for RpcRequestLatestBlockhash {
                 anyhow::bail!("read error: {error}")
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct RpcRequestLeaderSchedule {
+    state: Arc<State>,
+    x_subscription_id: Arc<str>,
+    id: Id<'static>,
+    slot: Slot,
+    is_processed: bool,
+    identity: Option<String>,
+}
+
+impl RpcRequestHandler for RpcRequestLeaderSchedule {
+    fn parse(
+        state: Arc<State>,
+        x_subscription_id: Arc<str>,
+        _upstream_disabled: bool,
+        request: Request<'_>,
+    ) -> Result<Self, Response<'_, serde_json::Value>> {
+        #[derive(Debug, Deserialize)]
+        struct ReqParams {
+            #[serde(default)]
+            options: Option<RpcLeaderScheduleConfigWrapper>,
+            #[serde(default)]
+            config: Option<RpcLeaderScheduleConfig>,
+        }
+
+        let (id, ReqParams { options, config }) = parse_params(request)?;
+        let (slot, maybe_config) = options.map(|options| options.unzip()).unwrap_or_default();
+        let config = maybe_config.or(config).unwrap_or_default();
+
+        if let Some(identity) = &config.identity {
+            if let Err(error) = verify_pubkey(identity) {
+                return Err(jsonrpc_response_error(id, error));
+            }
+        }
+
+        let (slot, is_processed) = match slot {
+            Some(slot) => {
+                if slot > state.stored_slots.processed_load() {
+                    return Err(jsonrpc_response_success(id, json!(None::<()>)));
+                }
+                (slot, slot > state.stored_slots.confirmed_load())
+            }
+            None => match config.commitment.unwrap_or_default().commitment {
+                CommitmentLevel::Processed => (state.stored_slots.processed_load(), true),
+                CommitmentLevel::Confirmed => (state.stored_slots.confirmed_load(), false),
+                CommitmentLevel::Finalized => (state.stored_slots.finalized_load(), false),
+            },
+        };
+
+        Ok(Self {
+            state,
+            x_subscription_id,
+            id: id.into_owned(),
+            slot,
+            is_processed,
+            identity: config.identity,
+        })
+    }
+
+    async fn process(self) -> RpcRequestResult<'static> {
+        let deadline = Instant::now() + self.state.request_timeout;
+
+        let Some(upstream) = self.state.upstream.as_ref() else {
+            unreachable!();
+        };
+
+        let epoch = self.state.epoch_schedule.get_epoch(self.slot);
+        upstream
+            .get_leader_schedule(
+                self.x_subscription_id,
+                deadline,
+                self.id,
+                epoch,
+                self.slot,
+                self.is_processed,
+                self.identity,
+            )
+            .await
     }
 }
 
@@ -1705,10 +1850,7 @@ impl RpcRequestHandler for RpcRequestTransaction {
 
         // verify commitment
         if self.commitment.is_finalized() && self.state.stored_slots.finalized_load() < slot {
-            return Ok(jsonrpc_response_success(
-                self.id,
-                serde_json::json!(None::<()>),
-            ));
+            return Ok(jsonrpc_response_success(self.id, json!(None::<()>)));
         }
 
         // verify that we still have data for that block (i.e. we read correct data)
@@ -1871,7 +2013,7 @@ impl RpcRequestHandler for RpcRequestVersion {
         let version = solana_version::Version::default();
         Err(jsonrpc_response_success(
             request.id,
-            serde_json::json!(RpcVersionInfo {
+            json!(RpcVersionInfo {
                 solana_core: version.to_string(),
                 feature_set: Some(version.feature_set),
             }),

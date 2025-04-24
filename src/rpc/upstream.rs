@@ -6,24 +6,32 @@ use {
             api::{X_ERROR, X_SLOT},
             api_jsonrpc::RpcRequestBlocksUntil,
         },
+        util::HashMap,
     },
+    futures::future::{BoxFuture, FutureExt, Shared},
     http_body_util::{BodyExt, Full as BodyFull},
     hyper::http::Result as HttpResult,
-    jsonrpsee_types::{Id, Response},
+    jsonrpsee_types::{Id, Response, ResponsePayload},
     metrics::counter,
+    quanta::Instant as QInstant,
     reqwest::{Client, StatusCode, Version, header::CONTENT_TYPE},
-    richat_shared::jsonrpc::helpers::{RpcResponse, X_SUBSCRIPTION_ID},
+    richat_shared::jsonrpc::helpers::{RpcResponse, X_SUBSCRIPTION_ID, jsonrpc_response_success},
     serde_json::json,
     solana_rpc_client_api::config::{
-        RpcBlockConfig, RpcSignatureStatusConfig, RpcSignaturesForAddressConfig,
-        RpcTransactionConfig,
+        RpcBlockConfig, RpcLeaderScheduleConfig, RpcLeaderScheduleConfigWrapper,
+        RpcSignatureStatusConfig, RpcSignaturesForAddressConfig, RpcTransactionConfig,
     },
     solana_sdk::{
-        clock::Slot, commitment_config::CommitmentConfig, pubkey::Pubkey, signature::Signature,
+        clock::Slot, commitment_config::CommitmentConfig, epoch_schedule::Epoch, pubkey::Pubkey,
+        signature::Signature,
     },
     solana_transaction_status::{BlockEncodingOptions, UiTransactionEncoding},
-    std::{sync::Arc, time::Instant},
-    tokio::time::timeout_at,
+    std::{
+        borrow::Cow,
+        sync::Arc,
+        time::{Duration, Instant},
+    },
+    tokio::{sync::Mutex, time::timeout_at},
     url::Url,
 };
 
@@ -151,25 +159,106 @@ impl RpcClientHttpget {
 }
 
 type RpcClientJsonrpcResult = anyhow::Result<jsonrpsee_types::Response<'static, serde_json::Value>>;
+type RpcClientJsonrpcResultRaw =
+    Result<jsonrpsee_types::Response<'static, serde_json::Value>, Cow<'static, str>>;
 
 #[derive(Debug)]
-pub struct RpcClientJsonrpc {
+pub struct RpcClientJsonrpcInner {
     client: Client,
     endpoint: String,
     version: Version,
 }
 
+impl RpcClientJsonrpcInner {
+    async fn call_with_timeout(
+        &self,
+        x_subscription_id: &str,
+        body: String,
+        deadline: Instant,
+    ) -> RpcClientJsonrpcResultRaw {
+        match timeout_at(deadline.into(), self.call(x_subscription_id, body)).await {
+            Ok(result) => result,
+            Err(_timeout) => Err(Cow::Borrowed("upstream timeout")),
+        }
+    }
+
+    async fn call_get_success(
+        &self,
+        x_subscription_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Cow<'_, serde_json::Value>, Cow<'static, str>> {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "id": 0,
+            "params": params
+        })
+        .to_string();
+
+        match self.call(x_subscription_id, body).await?.payload {
+            ResponsePayload::Success(value) => Ok(value),
+            ResponsePayload::Error(error) => {
+                Err(Cow::Owned(format!("failed to get value: {error:?}")))
+            }
+        }
+    }
+
+    async fn call(&self, x_subscription_id: &str, body: String) -> RpcClientJsonrpcResultRaw {
+        let request = self
+            .client
+            .post(&self.endpoint)
+            .version(self.version)
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-subscription-id", x_subscription_id)
+            .body(body);
+
+        let Ok(response) = request.send().await else {
+            return Err(Cow::Borrowed("request to upstream failed"));
+        };
+
+        if response.status() != StatusCode::OK {
+            return Err(Cow::Owned(format!(
+                "upstream response with status code: {}",
+                response.status()
+            )));
+        }
+
+        let Ok(bytes) = response.bytes().await else {
+            return Err(Cow::Borrowed("failed to collect bytes from upstream"));
+        };
+
+        serde_json::from_slice(&bytes)
+            .map(|response: Response<'_, serde_json::Value>| response.into_owned())
+            .map_err(|_error| Cow::Borrowed("failed to parse json from upstream"))
+    }
+}
+
+type CachedEpochSchedule =
+    Shared<BoxFuture<'static, Result<Arc<serde_json::Value>, Cow<'static, str>>>>;
+
+#[derive(Debug)]
+pub struct RpcClientJsonrpc {
+    inner: Arc<RpcClientJsonrpcInner>,
+    cache: CachedRequests,
+    cache_epoch_schedule: Arc<Mutex<HashMap<Epoch, CachedEpochSchedule>>>,
+}
+
 impl RpcClientJsonrpc {
-    pub fn new(config: ConfigRpcUpstream) -> anyhow::Result<Self> {
+    pub fn new(config: ConfigRpcUpstream, cache_ttl: Duration) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(config.user_agent)
             .timeout(config.timeout)
             .build()?;
 
         Ok(Self {
-            client,
-            endpoint: config.endpoint,
-            version: config.version,
+            inner: Arc::new(RpcClientJsonrpcInner {
+                client,
+                endpoint: config.endpoint,
+                version: config.version,
+            }),
+            cache: CachedRequests::new(cache_ttl),
+            cache_epoch_schedule: Arc::default(),
         })
     }
 
@@ -191,25 +280,27 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getBlock",
-                "id": id,
-                "params": [slot, RpcBlockConfig {
-                    encoding: Some(encoding),
-                    transaction_details: Some(encoding_options.transaction_details),
-                    rewards: Some(encoding_options.show_rewards),
-                    commitment: Some(commitment),
-                    max_supported_transaction_version: encoding_options
-                        .max_supported_transaction_version,
-                }]
-            })
-            .to_string(),
-            deadline,
-        )
-        .await
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getBlock",
+                    "id": id,
+                    "params": [slot, RpcBlockConfig {
+                        encoding: Some(encoding),
+                        transaction_details: Some(encoding_options.transaction_details),
+                        rewards: Some(encoding_options.show_rewards),
+                        commitment: Some(commitment),
+                        max_supported_transaction_version: encoding_options
+                            .max_supported_transaction_version,
+                    }]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn get_blocks(
@@ -233,7 +324,7 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
+        self.inner.call_with_timeout(
             x_subscription_id.as_ref(),
             json!({
                 "jsonrpc": "2.0",
@@ -248,6 +339,7 @@ impl RpcClientJsonrpc {
             deadline,
         )
         .await
+        .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn get_block_time(
@@ -264,18 +356,49 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getBlockTime",
-                "id": id,
-                "params": [slot]
-            })
-            .to_string(),
-            deadline,
-        )
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getBlockTime",
+                    "id": id,
+                    "params": [slot]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    pub async fn get_cluster_nodes(
+        &self,
+        x_subscription_id: Arc<str>,
+        deadline: Instant,
+        id: Id<'static>,
+    ) -> RpcClientJsonrpcResult {
+        let inner = Arc::clone(&self.inner);
+        let payload = CachedRequest::get(&self.cache.get_cluster_nodes, deadline, move || {
+            async move {
+                let result = inner
+                    .call_get_success(x_subscription_id.as_ref(), "getClusterNodes", json!([]))
+                    .await
+                    .map(|value| value.into_owned());
+                counter!(
+                    RPC_UPSTREAM_REQUESTS_TOTAL,
+                    "x_subscription_id" => x_subscription_id,
+                    "method" => "getClusterNodes",
+                )
+                .increment(1);
+                result
+            }
+            .boxed()
+        })
         .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        Ok(jsonrpc_response_success(id, payload))
     }
 
     pub async fn get_first_available_block(
@@ -291,18 +414,134 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getFirstAvailableBlock",
-                "id": id,
-                "params": []
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getFirstAvailableBlock",
+                    "id": id,
+                    "params": []
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_leader_schedule(
+        &self,
+        x_subscription_id: Arc<str>,
+        deadline: Instant,
+        id: Id<'static>,
+        epoch: Epoch,
+        slot: Slot,
+        is_processed: bool,
+        identity: Option<String>,
+    ) -> RpcClientJsonrpcResult {
+        if is_processed {
+            counter!(
+                RPC_UPSTREAM_REQUESTS_TOTAL,
+                "x_subscription_id" => Arc::clone(&x_subscription_id),
+                "method" => "getLeaderSchedule",
+            )
+            .increment(1);
+
+            return self
+                .inner
+                .call_with_timeout(
+                    x_subscription_id.as_ref(),
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "getLeaderSchedule",
+                        "id": id,
+                        "params": [
+                            RpcLeaderScheduleConfigWrapper::SlotOnly(Some(slot)),
+                            RpcLeaderScheduleConfig { identity, commitment: Some(CommitmentConfig::processed()) }
+                        ]
+                    })
+                    .to_string(),
+                    deadline,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error));
+        }
+
+        let mut locked = self.cache_epoch_schedule.lock().await;
+        let request = locked
+            .get(&epoch)
+            .and_then(|fut| {
+                if !fut.peek().map(|v| v.is_err()).unwrap_or_default() {
+                    Some(fut.clone())
+                } else {
+                    None
+                }
             })
-            .to_string(),
-            deadline,
-        )
-        .await
+            .unwrap_or_else(|| {
+                let inner = Arc::clone(&self.inner);
+                let fut = async move {
+                    let result = inner
+                        .call_get_success(
+                            x_subscription_id.as_ref(),
+                            "getLeaderSchedule",
+                            json!([
+                                RpcLeaderScheduleConfigWrapper::SlotOnly(Some(slot)),
+                                RpcLeaderScheduleConfig {
+                                    identity: None,
+                                    commitment: Some(CommitmentConfig::confirmed())
+                                }
+                            ]),
+                        )
+                        .await
+                        .map(|value| Arc::new(value.into_owned()));
+                    counter!(
+                        RPC_UPSTREAM_REQUESTS_TOTAL,
+                        "x_subscription_id" => x_subscription_id,
+                        "method" => "getLeaderSchedule",
+                    )
+                    .increment(1);
+                    if let Ok(payload) = &result {
+                        if !payload.is_null() && !payload.is_object() {
+                            return Err(Cow::Borrowed("invalid response type"));
+                        }
+                    }
+                    result
+                }
+                .boxed()
+                .shared();
+                locked.insert(epoch, fut.clone());
+                fut
+            });
+        drop(locked);
+
+        let payload = match timeout_at(deadline.into(), request).await {
+            Ok(result) => result,
+            Err(_timeout) => Err(Cow::Borrowed("upstream timeout")),
+        }
+        .map_err(|error| anyhow::anyhow!(error))?;
+
+        if let Some(identity) = identity {
+            if payload.is_null() {
+                return Ok(jsonrpc_response_success(id, serde_json::Value::Null));
+            }
+
+            let Some(map) = payload.as_object() else {
+                unreachable!()
+            };
+
+            if let Some(slots) = map.get(&identity) {
+                Ok(jsonrpc_response_success(
+                    id,
+                    json!({ identity.to_string(): slots }),
+                ))
+            } else {
+                Ok(jsonrpc_response_success(id, json!({})))
+            }
+        } else {
+            Ok(jsonrpc_response_success(id, payload.as_ref().clone()))
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -324,24 +563,26 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getSignaturesForAddress",
-                "id": id,
-                "params": [address.to_string(), RpcSignaturesForAddressConfig {
-                    before: before.map(|s| s.to_string()),
-                    until: until.map(|s| s.to_string()),
-                    limit: Some(limit),
-                    commitment: Some(commitment),
-                    min_context_slot: None,
-                }]
-            })
-            .to_string(),
-            deadline,
-        )
-        .await
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getSignaturesForAddress",
+                    "id": id,
+                    "params": [address.to_string(), RpcSignaturesForAddressConfig {
+                        before: before.map(|s| s.to_string()),
+                        until: until.map(|s| s.to_string()),
+                        limit: Some(limit),
+                        commitment: Some(commitment),
+                        min_context_slot: None,
+                    }]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn get_signature_statuses(
@@ -360,20 +601,22 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getSignatureStatuses",
-                "id": id,
-                "params": [signatures, RpcSignatureStatusConfig {
-                    search_transaction_history: true
-                }]
-            })
-            .to_string(),
-            deadline,
-        )
-        .await
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getSignatureStatuses",
+                    "id": id,
+                    "params": [signatures, RpcSignatureStatusConfig {
+                        search_transaction_history: true
+                    }]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -394,61 +637,78 @@ impl RpcClientJsonrpc {
         )
         .increment(1);
 
-        self.call_with_timeout(
-            x_subscription_id.as_ref(),
-            json!({
-                "jsonrpc": "2.0",
-                "method": "getTransaction",
-                "id": id,
-                "params": [signature.to_string(), RpcTransactionConfig {
-                    encoding: Some(encoding),
-                    commitment: Some(commitment),
-                    max_supported_transaction_version,
-                }]
-            })
-            .to_string(),
-            deadline,
-        )
-        .await
+        self.inner
+            .call_with_timeout(
+                x_subscription_id.as_ref(),
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getTransaction",
+                    "id": id,
+                    "params": [signature.to_string(), RpcTransactionConfig {
+                        encoding: Some(encoding),
+                        commitment: Some(commitment),
+                        max_supported_transaction_version,
+                    }]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))
     }
+}
 
-    async fn call_with_timeout(
-        &self,
-        x_subscription_id: &str,
-        body: String,
-        deadline: Instant,
-    ) -> RpcClientJsonrpcResult {
-        match timeout_at(deadline.into(), self.call(x_subscription_id, body)).await {
-            Ok(result) => result,
-            Err(_timeout) => anyhow::bail!("upstream timeout"),
+#[derive(Debug)]
+struct CachedRequests {
+    get_cluster_nodes: Mutex<CachedRequest<serde_json::Value>>,
+}
+
+impl CachedRequests {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            get_cluster_nodes: Mutex::new(CachedRequest::new(ttl)),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedRequest<T> {
+    ttl: Duration,
+    ts: QInstant,
+    request: Shared<BoxFuture<'static, Result<T, Cow<'static, str>>>>,
+}
+
+impl<T: Clone> CachedRequest<T> {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            ts: QInstant::now().checked_sub(ttl * 2).unwrap(),
+            request: async move { Err(Cow::Borrowed("uninit")) }.boxed().shared(),
         }
     }
 
-    async fn call(&self, x_subscription_id: &str, body: String) -> RpcClientJsonrpcResult {
-        let request = self
-            .client
-            .post(&self.endpoint)
-            .version(self.version)
-            .header(CONTENT_TYPE, "application/json")
-            .header("x-subscription-id", x_subscription_id)
-            .body(body);
-
-        let Ok(response) = request.send().await else {
-            anyhow::bail!("request to upstream failed");
+    async fn get(
+        request: &Mutex<Self>,
+        deadline: Instant,
+        fetch: impl FnOnce() -> BoxFuture<'static, Result<T, Cow<'static, str>>>,
+    ) -> Result<T, Cow<'static, str>> {
+        let mut locked = request.lock().await;
+        if locked.ts.elapsed() >= locked.ttl
+            || locked
+                .request
+                .peek()
+                .map(|v| v.is_err())
+                .unwrap_or_default()
+        {
+            locked.ts = QInstant::now();
+            locked.request = fetch().shared();
         };
+        let request = locked.request.clone();
+        drop(locked);
 
-        anyhow::ensure!(
-            response.status() == StatusCode::OK,
-            "upstream response with status code: {}",
-            response.status()
-        );
-
-        let Ok(bytes) = response.bytes().await else {
-            anyhow::bail!("failed to collect bytes from upstream");
-        };
-
-        serde_json::from_slice(&bytes)
-            .map(|response: Response<'_, serde_json::Value>| response.into_owned())
-            .map_err(|_error| anyhow::anyhow!("failed to parse json from upstream"))
+        match timeout_at(deadline.into(), request).await {
+            Ok(result) => result,
+            Err(_timeout) => Err(Cow::Borrowed("upstream timeout")),
+        }
     }
 }
