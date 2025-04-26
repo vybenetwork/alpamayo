@@ -84,8 +84,8 @@ impl StoredSlots {
         self.processed.load(Ordering::SeqCst)
     }
 
-    pub fn processed_store(&self, slot: Slot) {
-        self.processed.store(slot, Ordering::SeqCst);
+    fn processed_store_max(&self, slot: Slot) {
+        let slot = self.processed.fetch_max(slot, Ordering::SeqCst).max(slot);
         self.metrics.processed.set(slot as f64);
     }
 
@@ -93,7 +93,7 @@ impl StoredSlots {
         self.confirmed.load(Ordering::SeqCst)
     }
 
-    pub fn confirmed_store(&self, slot: Slot) {
+    fn confirmed_store(&self, slot: Slot) {
         self.confirmed.store(slot, Ordering::SeqCst);
         self.metrics.confirmed.set(slot as f64);
     }
@@ -102,9 +102,11 @@ impl StoredSlots {
         self.finalized.load(Ordering::Relaxed)
     }
 
-    pub fn finalized_store(&self, slot: Slot) {
-        self.finalized.store(slot, Ordering::Relaxed);
-        self.metrics.finalized.set(slot as f64);
+    fn finalized_store(&self, slot: Slot) {
+        if slot >= self.first_available_load() {
+            self.finalized.store(slot, Ordering::Relaxed);
+            self.metrics.finalized.set(slot as f64);
+        }
     }
 
     pub fn first_available_load(&self) -> Slot {
@@ -125,6 +127,7 @@ impl StoredSlots {
 #[derive(Debug, Clone)]
 pub struct StoredSlotsRead {
     stored_slots: StoredSlots,
+    slots_processed: Arc<Mutex<HashMap<Slot, HashSet<usize>>>>,
     slots_confirmed: Arc<Mutex<HashMap<Slot, HashSet<usize>>>>,
     slots_finalized: Arc<Mutex<HashMap<Slot, HashSet<usize>>>>,
     max_recent_blockhashes: Arc<Mutex<usize>>,
@@ -136,6 +139,7 @@ impl StoredSlotsRead {
     pub fn new(stored_slots: StoredSlots, total_readers: usize) -> Self {
         Self {
             stored_slots,
+            slots_processed: Arc::default(),
             slots_confirmed: Arc::default(),
             slots_finalized: Arc::default(),
             max_recent_blockhashes: Arc::default(),
@@ -163,8 +167,15 @@ impl StoredSlotsRead {
         }
     }
 
+    pub fn set_processed(&self, index: usize, slot: Slot) {
+        if self.set(&self.slots_processed, index, slot) {
+            self.stored_slots.processed_store_max(slot);
+        }
+    }
+
     pub fn set_confirmed(&self, index: usize, slot: Slot) {
         if self.set(&self.slots_confirmed, index, slot) {
+            self.stored_slots.processed_store_max(slot);
             self.stored_slots.confirmed_store(slot);
         }
     }

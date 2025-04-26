@@ -159,7 +159,10 @@ async fn start2(
             // sync update
             message = sync_rx.recv() => match message {
                 Ok(ReadWriteSyncMessage::Init { .. }) => anyhow::bail!("unexpected second init"),
-                Ok(ReadWriteSyncMessage::BlockNew { slot, block }) => storage_processed.add_processed_block(slot, block),
+                Ok(ReadWriteSyncMessage::BlockNew { slot, block }) => {
+                    stored_slots_read.set_processed(index, slot);
+                    storage_processed.add_processed_block(slot, block);
+                },
                 Ok(ReadWriteSyncMessage::BlockDead { slot }) => storage_processed.mark_dead(slot),
                 Ok(ReadWriteSyncMessage::BlockConfirmed { slot, block }) => {
                     stored_slots_read.set_confirmed(index, slot);
@@ -267,10 +270,10 @@ struct StorageProcessed {
     confirmed_height: Slot,
     finalized_slot: Slot,
     finalized_height: Slot,
-    blocks: BTreeMap<Slot, Option<Arc<BlockWithBinary>>>,
-    signature_statuses: HashMap<Signature, SignatureStatus>,
-    recent_blocks: BTreeMap<Slot, RecentBlock>,
-    block_heights: HashMap<String, Slot>,
+    blocks: BTreeMap<Slot, Option<Arc<BlockWithBinary>>>, // only processed
+    signature_statuses: HashMap<Signature, SignatureStatus>, // from MAX_RECENT_BLOCKHASHES
+    recent_blocks: BTreeMap<Slot, RecentBlock>,           // MAX_RECENT_BLOCKHASHES
+    block_heights: HashMap<String, Slot>,                 // MAX_RECENT_BLOCKHASHES
 }
 
 impl StorageProcessed {
@@ -384,12 +387,10 @@ impl StorageProcessed {
     }
 
     fn set_finalized(&mut self, slot: Slot) {
-        self.finalized_slot = slot;
-        self.finalized_height = self
-            .recent_blocks
-            .get(&slot)
-            .map(|rb| rb.block_height)
-            .unwrap_or(self.finalized_height);
+        if let Some(block) = self.recent_blocks.get(&slot) {
+            self.finalized_slot = slot;
+            self.finalized_height = block.block_height;
+        }
     }
 
     fn is_ready(&self) -> bool {

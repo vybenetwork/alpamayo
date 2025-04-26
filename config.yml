@@ -13,6 +13,9 @@ source:
     concurrency: 10
   stream:
     source: richat # valid: richat, dragons_mouth
+    reconnect:
+      backoff_init: 100ms
+      backoff_max: 1s
     endpoint: http://127.0.0.1:10000
     ca_certificate: null
     connect_timeout: null
@@ -36,7 +39,7 @@ storage:
     max: 1_000
     rpc_getblock_max_retries: 10
     rpc_getblock_backoff_init: 100ms
-    rpc_getblock_max_concurrency: 15
+    rpc_getblock_max_concurrency: 10
     files:
       - id: 0
         path: ./db/alpamayo/storage0

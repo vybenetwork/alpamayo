@@ -82,7 +82,6 @@ pub fn start(
                 )?;
                 let (mut storage_files, storage_files_read_sync_init) =
                     StorageFilesWrite::open(files, &blocks).await?;
-                let storage_memory = StorageMemory::default();
 
                 // load recent blocks
                 let ts = Instant::now();
@@ -164,7 +163,6 @@ pub fn start(
                     blocks,
                     db_write,
                     &mut storage_files,
-                    storage_memory,
                     sync_tx,
                     shutdown,
                 )
@@ -190,7 +188,6 @@ async fn start2(
     mut blocks: StoredBlocksWrite,
     db_write: RocksdbWrite,
     storage_files: &mut StorageFilesWrite,
-    mut storage_memory: StorageMemory,
     sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
@@ -209,6 +206,9 @@ async fn start2(
                 match rpc.get_block(slot).await {
                     Ok(block) => return Ok((slot, Some(block))),
                     Err(error) => {
+                        if matches!(error, RpcSourceConnectedError::SendError) {
+                            return Err(error);
+                        }
                         if matches!(
                             error,
                             RpcSourceConnectedError::Error(GetBlockError::SlotSkipped(_))
@@ -218,7 +218,7 @@ async fn start2(
                         if max_retries == 0 {
                             return Err(error);
                         }
-                        warn!(?error, slot, "failed to get confirmed block");
+                        warn!(?error, slot, max_retries, "failed to get confirmed block");
                         max_retries -= 1;
                         sleep(backoff_wait).await;
                         backoff_wait *= 2;
@@ -232,13 +232,9 @@ async fn start2(
 
     // queue of confirmed blocks
     let mut queued_slots = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
-    let mut queued_slots_backfilled = false;
 
     // fill the gap between stored and new
-    let mut next_confirmed_slot = match rpc.get_slot_confirmed().await {
-        Ok(slot) => slot,
-        Err(error) => return Err(error.into()),
-    };
+    let mut next_confirmed_slot = load_confirmed_slot(&rpc, &stored_slots, &sync_tx).await?;
     if let Some(slot) = blocks.get_latest_slot() {
         let mut next_confirmed_slot_last_update = Instant::now();
         let mut next_rpc_request_slot = slot + 1;
@@ -256,11 +252,8 @@ async fn start2(
 
         loop {
             // update confirmed slot every 3s
-            if next_confirmed_slot_last_update.elapsed() > Duration::from_secs(3) {
-                next_confirmed_slot = match rpc.get_slot_confirmed().await {
-                    Ok(slot) => slot,
-                    Err(error) => return Err(error.into()),
-                };
+            if next_confirmed_slot_last_update.elapsed() > Duration::from_secs(2) {
+                next_confirmed_slot = load_confirmed_slot(&rpc, &stored_slots, &sync_tx).await?;
                 next_confirmed_slot_last_update = Instant::now();
                 info!(
                     slot_db = next_database_slot,
@@ -287,8 +280,11 @@ async fn start2(
             // push block into the queue
             match rpc_requests.next().await {
                 Some(Ok(Ok((slot, block)))) => {
-                    queued_slots.insert(slot, block.map(Arc::new));
+                    if slot >= next_database_slot {
+                        queued_slots.insert(slot, block.map(Arc::new));
+                    }
                 }
+                Some(Ok(Err(RpcSourceConnectedError::SendError))) => return Ok(()),
                 Some(Ok(Err(error))) => {
                     return Err(error).context("failed to get confirmed block");
                 }
@@ -316,6 +312,8 @@ async fn start2(
     }
     stream_start.notify_one();
 
+    let mut storage_memory = StorageMemory::default();
+
     tokio::pin!(shutdown);
     loop {
         let rpc_requests_next = if rpc_requests.is_empty() {
@@ -329,8 +327,11 @@ async fn start2(
             // insert block requested from rpc
             message = rpc_requests_next => match message {
                 Some(Ok(Ok((slot, block)))) => {
-                    queued_slots.insert(slot, block.map(Arc::new));
+                    if slot >= next_confirmed_slot {
+                        queued_slots.insert(slot, block.map(Arc::new));
+                    }
                 },
+                Some(Ok(Err(RpcSourceConnectedError::SendError))) => return Ok(()),
                 Some(Ok(Err(error))) => {
                     return Err(error).context("failed to get confirmed block");
                 },
@@ -344,11 +345,13 @@ async fn start2(
                 Some(message) => {
                     // add message
                     match message {
+                        StreamSourceMessage::Start => {
+                            storage_memory = StorageMemory::default();
+                        }
                         StreamSourceMessage::Block { slot, block } => {
                             let block = Arc::new(block);
                             storage_memory.add_processed(slot, Arc::clone(&block));
                             let _ = sync_tx.send(ReadWriteSyncMessage::BlockNew { slot, block });
-                            stored_slots.processed_store(slot);
                         }
                         StreamSourceMessage::SlotStatus { slot, status, .. } => {
                             match status {
@@ -362,17 +365,6 @@ async fn start2(
                                 },
                             }
                         }
-                        StreamSourceMessage::SlotStatusInit { slot, status } => {
-                            if slot >= stored_slots.first_available_load() {
-                                match status {
-                                    StreamSourceSlotStatus::Confirmed => stored_slots.confirmed_store(slot),
-                                    StreamSourceSlotStatus::Finalized => {
-                                        let _ = sync_tx.send(ReadWriteSyncMessage::SlotFinalized { slot });
-                                    }
-                                    _ => unreachable!(),
-                                }
-                            }
-                        }
                     }
 
                     // get confirmed and push to the queue
@@ -381,18 +373,7 @@ async fn start2(
                             continue;
                         }
 
-                        if !queued_slots_backfilled && block.get_slot() > next_confirmed_slot {
-                            queued_slots_backfilled = true;
-
-                            if block.get_slot() - next_confirmed_slot > rpc_getblock_max_concurrency as u64 {
-                                return Err(anyhow::anyhow!(
-                                    "backfill is too big: slot {} / next_confirmed_slot {} / rpc_getblock_max_concurrency {}",
-                                    block.get_slot(),
-                                    next_confirmed_slot,
-                                    rpc_getblock_max_concurrency,
-                                ))
-                            }
-
+                        if block.get_slot() > next_confirmed_slot {
                             for slot in next_confirmed_slot..block.get_slot() {
                                 get_confirmed_block(&mut rpc_requests, slot);
                             }
@@ -432,4 +413,21 @@ async fn start2(
             next_confirmed_slot += 1;
         }
     }
+}
+
+async fn load_confirmed_slot(
+    rpc: &RpcSourceConnected,
+    stored_slots: &StoredSlots,
+    sync_tx: &broadcast::Sender<ReadWriteSyncMessage>,
+) -> anyhow::Result<Slot> {
+    let ts = Instant::now();
+    let (finalized_slot, confirmed_slot) = rpc.get_slots().await?;
+    // set finalized slot
+    if finalized_slot >= stored_slots.first_available_load() {
+        let _ = sync_tx.send(ReadWriteSyncMessage::SlotFinalized {
+            slot: finalized_slot,
+        });
+    }
+    info!(elapsed = ?ts.elapsed(), finalized_slot, confirmed_slot, "load finalized & confirmed slots");
+    Ok(confirmed_slot)
 }

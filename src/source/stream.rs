@@ -64,6 +64,7 @@ pub enum StreamSourceSlotStatus {
 
 #[derive(Debug)]
 pub enum StreamSourceMessage {
+    Start,
     Block {
         slot: Slot,
         block: BlockWithBinary,
@@ -71,10 +72,6 @@ pub enum StreamSourceMessage {
     SlotStatus {
         slot: Slot,
         parent: Slot,
-        status: StreamSourceSlotStatus,
-    },
-    SlotStatusInit {
-        slot: Slot,
         status: StreamSourceSlotStatus,
     },
 }
@@ -270,26 +267,6 @@ impl Stream for StreamSource {
                         // drop message if less or eq to first processed
                         let first_processed = match this.first_processed {
                             Some(first_processed) if slot > first_processed => first_processed,
-                            _ if matches!(
-                                status,
-                                SlotStatusProto::SlotConfirmed | SlotStatusProto::SlotFinalized
-                            ) =>
-                            {
-                                return Poll::Ready(Some(Ok(
-                                    StreamSourceMessage::SlotStatusInit {
-                                        slot,
-                                        status: match status {
-                                            SlotStatusProto::SlotConfirmed => {
-                                                StreamSourceSlotStatus::Confirmed
-                                            }
-                                            SlotStatusProto::SlotFinalized => {
-                                                StreamSourceSlotStatus::Finalized
-                                            }
-                                            _ => unreachable!(),
-                                        },
-                                    },
-                                )));
-                            }
                             _ => continue,
                         };
 
@@ -310,6 +287,16 @@ impl Stream for StreamSource {
                                     _ => break,
                                 }
                             }
+
+                            return Poll::Ready(Some(if let Some(parent) = parent {
+                                Ok(StreamSourceMessage::SlotStatus {
+                                    slot,
+                                    parent,
+                                    status: StreamSourceSlotStatus::Finalized,
+                                })
+                            } else {
+                                Err(RecvError::MissedParent(slot))
+                            }));
                         }
 
                         // create slot info
@@ -352,14 +339,6 @@ impl Stream for StreamSource {
                                 SlotStatusProto::SlotConfirmed,
                             ) => {
                                 slot_info.status = SlotStatusProto::SlotConfirmed;
-                                parent
-                            }
-                            (
-                                Some(parent),
-                                SlotStatusProto::SlotConfirmed,
-                                SlotStatusProto::SlotFinalized,
-                            ) => {
-                                slot_info.status = SlotStatusProto::SlotFinalized;
                                 parent
                             }
                             _ => {
