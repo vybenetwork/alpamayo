@@ -25,7 +25,7 @@ use {
         clock::Slot, commitment_config::CommitmentConfig, epoch_schedule::Epoch, pubkey::Pubkey,
         signature::Signature,
     },
-    solana_transaction_status::{BlockEncodingOptions, UiTransactionEncoding},
+    solana_transaction_status::{BlockEncodingOptions, UiConfirmedBlock, UiTransactionEncoding},
     std::{
         borrow::Cow,
         sync::Arc,
@@ -240,12 +240,12 @@ type CachedEpochSchedule =
 #[derive(Debug)]
 pub struct RpcClientJsonrpc {
     inner: Arc<RpcClientJsonrpcInner>,
-    cache: CachedRequests,
+    cache_cluster_nodes: CachedRequests<serde_json::Value>,
     cache_epoch_schedule: Arc<Mutex<HashMap<Epoch, CachedEpochSchedule>>>,
 }
 
 impl RpcClientJsonrpc {
-    pub fn new(config: ConfigRpcUpstream, cache_ttl: Duration) -> anyhow::Result<Self> {
+    pub fn new(config: ConfigRpcUpstream, gcn_cache_ttl: Duration) -> anyhow::Result<Self> {
         let client = Client::builder()
             .user_agent(config.user_agent)
             .timeout(config.timeout)
@@ -257,7 +257,7 @@ impl RpcClientJsonrpc {
                 endpoint: config.endpoint,
                 version: config.version,
             }),
-            cache: CachedRequests::new(cache_ttl),
+            cache_cluster_nodes: CachedRequests::new(gcn_cache_ttl),
             cache_epoch_schedule: Arc::default(),
         })
     }
@@ -303,6 +303,39 @@ impl RpcClientJsonrpc {
             .map_err(|error| anyhow::anyhow!(error))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_block_rewards(
+        &self,
+        deadline: Instant,
+        id: &Id<'static>,
+        slot: Slot,
+    ) -> anyhow::Result<
+        Result<Option<UiConfirmedBlock>, jsonrpsee_types::Response<'static, serde_json::Value>>,
+    > {
+        let result = self.inner
+            .call_with_timeout(
+                "",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getBlock",
+                    "id": id,
+                    "params": [slot, RpcBlockConfig::rewards_with_commitment(Some(CommitmentConfig::confirmed()))]
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        let ResponsePayload::Success(value) = result.payload else {
+            return Ok(Err(result));
+        };
+
+        serde_json::from_value(value.into_owned())
+            .map(Ok)
+            .map_err(|error| anyhow::anyhow!("failed to parse response: {error:?}"))
+    }
+
     pub async fn get_blocks(
         &self,
         x_subscription_id: Arc<str>,
@@ -342,6 +375,39 @@ impl RpcClientJsonrpc {
         .map_err(|error| anyhow::anyhow!(error))
     }
 
+    pub async fn get_blocks_parsed(
+        &self,
+        deadline: Instant,
+        id: &Id<'static>,
+        start_slot: Slot,
+        limit: usize,
+    ) -> anyhow::Result<Result<Vec<Slot>, jsonrpsee_types::Response<'static, serde_json::Value>>>
+    {
+        let result = self
+            .inner
+            .call_with_timeout(
+                "",
+                json!({
+                    "jsonrpc": "2.0",
+                    "method": "getBlocksWithLimit",
+                    "id": id,
+                    "params": json!([start_slot, limit, CommitmentConfig::confirmed()]),
+                })
+                .to_string(),
+                deadline,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
+
+        let ResponsePayload::Success(value) = result.payload else {
+            return Ok(Err(result));
+        };
+
+        serde_json::from_value(value.into_owned())
+            .map(Ok)
+            .map_err(|error| anyhow::anyhow!("failed to parse response: {error:?}"))
+    }
+
     pub async fn get_block_time(
         &self,
         x_subscription_id: Arc<str>,
@@ -379,24 +445,26 @@ impl RpcClientJsonrpc {
         id: Id<'static>,
     ) -> RpcClientJsonrpcResult {
         let inner = Arc::clone(&self.inner);
-        let payload = CachedRequest::get(&self.cache.get_cluster_nodes, deadline, move || {
-            async move {
-                let result = inner
-                    .call_get_success(x_subscription_id.as_ref(), "getClusterNodes", json!([]))
-                    .await
-                    .map(|value| value.into_owned());
-                counter!(
-                    RPC_UPSTREAM_REQUESTS_TOTAL,
-                    "x_subscription_id" => x_subscription_id,
-                    "method" => "getClusterNodes",
-                )
-                .increment(1);
-                result
-            }
-            .boxed()
-        })
-        .await
-        .map_err(|error| anyhow::anyhow!(error))?;
+        let payload = self
+            .cache_cluster_nodes
+            .get(deadline, move || {
+                async move {
+                    let result = inner
+                        .call_get_success(x_subscription_id.as_ref(), "getClusterNodes", json!([]))
+                        .await
+                        .map(|value| value.into_owned());
+                    counter!(
+                        RPC_UPSTREAM_REQUESTS_TOTAL,
+                        "x_subscription_id" => x_subscription_id,
+                        "method" => "getClusterNodes",
+                    )
+                    .increment(1);
+                    result
+                }
+                .boxed()
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!(error))?;
 
         Ok(jsonrpc_response_success(id, payload))
     }
@@ -659,14 +727,39 @@ impl RpcClientJsonrpc {
 }
 
 #[derive(Debug)]
-struct CachedRequests {
-    get_cluster_nodes: Mutex<CachedRequest<serde_json::Value>>,
+struct CachedRequests<T> {
+    inner: Mutex<CachedRequest<T>>,
 }
 
-impl CachedRequests {
+impl<T: Clone> CachedRequests<T> {
     fn new(ttl: Duration) -> Self {
         Self {
-            get_cluster_nodes: Mutex::new(CachedRequest::new(ttl)),
+            inner: Mutex::new(CachedRequest::new(ttl)),
+        }
+    }
+
+    async fn get(
+        &self,
+        deadline: Instant,
+        fetch: impl FnOnce() -> BoxFuture<'static, Result<T, Cow<'static, str>>>,
+    ) -> Result<T, Cow<'static, str>> {
+        let mut locked = self.inner.lock().await;
+        if locked.ts.elapsed() >= locked.ttl
+            || locked
+                .request
+                .peek()
+                .map(|v| v.is_err())
+                .unwrap_or_default()
+        {
+            locked.ts = QInstant::now();
+            locked.request = fetch().shared();
+        };
+        let request = locked.request.clone();
+        drop(locked);
+
+        match timeout_at(deadline.into(), request).await {
+            Ok(result) => result,
+            Err(_timeout) => Err(Cow::Borrowed("upstream timeout")),
         }
     }
 }
@@ -684,31 +777,6 @@ impl<T: Clone> CachedRequest<T> {
             ttl,
             ts: QInstant::now().checked_sub(ttl * 2).unwrap(),
             request: async move { Err(Cow::Borrowed("uninit")) }.boxed().shared(),
-        }
-    }
-
-    async fn get(
-        request: &Mutex<Self>,
-        deadline: Instant,
-        fetch: impl FnOnce() -> BoxFuture<'static, Result<T, Cow<'static, str>>>,
-    ) -> Result<T, Cow<'static, str>> {
-        let mut locked = request.lock().await;
-        if locked.ts.elapsed() >= locked.ttl
-            || locked
-                .request
-                .peek()
-                .map(|v| v.is_err())
-                .unwrap_or_default()
-        {
-            locked.ts = QInstant::now();
-            locked.request = fetch().shared();
-        };
-        let request = locked.request.clone();
-        drop(locked);
-
-        match timeout_at(deadline.into(), request).await {
-            Ok(result) => result,
-            Err(_timeout) => Err(Cow::Borrowed("upstream timeout")),
         }
     }
 }
