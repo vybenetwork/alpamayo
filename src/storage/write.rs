@@ -13,10 +13,10 @@ use {
             memory::{MemoryConfirmedBlock, StorageMemory},
             rocksdb::{RocksdbRead, RocksdbWrite},
             slots::StoredSlots,
-            source::{RpcRequest, RpcSourceConnected, RpcSourceConnectedError},
+            source::{RpcSourceConnected, RpcSourceConnectedError},
             sync::ReadWriteSyncMessage,
         },
-        util::HashMap,
+        util::{HashMap, HashSet},
     },
     anyhow::Context,
     futures::{
@@ -34,7 +34,11 @@ use {
     solana_sdk::clock::Slot,
     solana_storage_proto::convert::generated,
     solana_transaction_status::ConfirmedBlock,
-    std::{sync::Arc, thread, time::Duration},
+    std::{
+        sync::{Arc, Mutex},
+        thread,
+        time::Duration,
+    },
     tokio::{
         sync::{Notify, broadcast, mpsc},
         task::{JoinHandle, spawn_local},
@@ -49,7 +53,7 @@ pub fn start(
     stored_slots: StoredSlots,
     db_write: RocksdbWrite,
     db_read: RocksdbRead,
-    rpc_tx: mpsc::Sender<RpcRequest>,
+    rpc_storage_source: RpcSourceConnected,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
     sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
@@ -70,8 +74,6 @@ pub fn start(
 
                 let rpc_getblock_max_retries = config.blocks.rpc_getblock_max_retries;
                 let rpc_getblock_backoff_init = config.blocks.rpc_getblock_backoff_init;
-                let rpc_getblock_max_concurrency = config.blocks.rpc_getblock_max_concurrency;
-                let rpc = RpcSourceConnected::new(rpc_tx);
 
                 let files = config.blocks.files.clone();
                 let blocks = StoredBlocksWrite::new(
@@ -156,8 +158,7 @@ pub fn start(
                     stored_slots,
                     rpc_getblock_max_retries,
                     rpc_getblock_backoff_init,
-                    rpc_getblock_max_concurrency,
-                    rpc,
+                    Arc::new(rpc_storage_source),
                     stream_start,
                     stream_rx,
                     blocks,
@@ -181,8 +182,7 @@ async fn start2(
     stored_slots: StoredSlots,
     rpc_getblock_max_retries: usize,
     rpc_getblock_backoff_init: Duration,
-    rpc_getblock_max_concurrency: usize,
-    rpc: RpcSourceConnected,
+    rpc: Arc<RpcSourceConnected>,
     stream_start: Arc<Notify>,
     mut stream_rx: mpsc::Receiver<StreamSourceMessage>,
     mut blocks: StoredBlocksWrite,
@@ -192,31 +192,38 @@ async fn start2(
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
     // get block requests
+    let rpc_block_inprogress = Arc::new(Mutex::new(HashSet::<Slot>::default()));
     let mut rpc_requests = FuturesUnordered::new();
     #[allow(clippy::type_complexity)]
     let get_confirmed_block = |rpc_requests: &mut FuturesUnordered<
         JoinHandle<Result<(u64, Option<BlockWithBinary>), RpcSourceConnectedError<GetBlockError>>>,
     >,
                                slot: Slot| {
+        let mut locked = rpc_block_inprogress.lock().expect("unpoisoned");
+        if !locked.insert(slot) {
+            return;
+        }
+
         let mut max_retries = rpc_getblock_max_retries;
         let mut backoff_wait = rpc_getblock_backoff_init;
-        let rpc = rpc.clone();
+        let rpc = Arc::clone(&rpc);
+        let rpc_block_inprogress = Arc::clone(&rpc_block_inprogress);
         rpc_requests.push(spawn_local(async move {
-            loop {
+            let result = loop {
                 match rpc.get_block(slot).await {
-                    Ok(block) => return Ok((slot, Some(block))),
+                    Ok(block) => break Ok((slot, Some(block))),
                     Err(error) => {
                         if matches!(error, RpcSourceConnectedError::SendError) {
-                            return Err(error);
+                            break Err(error);
                         }
                         if matches!(
                             error,
                             RpcSourceConnectedError::Error(GetBlockError::SlotSkipped(_))
                         ) {
-                            return Ok((slot, None));
+                            break Ok((slot, None));
                         }
                         if max_retries == 0 {
-                            return Err(error);
+                            break Err(error);
                         }
                         warn!(?error, slot, max_retries, "failed to get confirmed block");
                         max_retries -= 1;
@@ -224,7 +231,10 @@ async fn start2(
                         backoff_wait *= 2;
                     }
                 }
-            }
+            };
+            let mut locked = rpc_block_inprogress.lock().expect("unpoisoned");
+            locked.remove(&slot);
+            result
         }));
     };
 
@@ -276,9 +286,7 @@ async fn start2(
             }
 
             // get blocks
-            while next_rpc_request_slot <= next_confirmed_slot
-                && rpc_requests.len() < rpc_getblock_max_concurrency
-            {
+            while next_rpc_request_slot <= next_confirmed_slot && !rpc.is_full() {
                 get_confirmed_block(&mut rpc_requests, next_rpc_request_slot);
                 next_rpc_request_slot += 1;
             }
