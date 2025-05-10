@@ -53,7 +53,7 @@ impl StoredBlocksWrite {
             sync_tx,
         };
 
-        stored_slots.first_available_store(this.front_slot());
+        stored_slots.first_available_store(this.get_first_slot());
 
         Ok(this)
     }
@@ -109,11 +109,11 @@ impl StoredBlocksWrite {
         block.exists.then_some(block.slot)
     }
 
-    pub fn push_block_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
-        self.push_block2(StoredBlock::new_dead(slot))
+    pub fn push_block_front_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
+        self.push_block_front2(StoredBlock::new_dead(slot))
     }
 
-    pub fn push_block_confirmed(
+    pub fn push_block_front_confirmed(
         &mut self,
         slot: Slot,
         block_time: Option<UnixTimestamp>,
@@ -122,7 +122,7 @@ impl StoredBlocksWrite {
         offset: u64,
         block_size: u64,
     ) -> anyhow::Result<()> {
-        self.push_block2(StoredBlock::new_confirmed(
+        self.push_block_front2(StoredBlock::new_confirmed(
             slot,
             block_time,
             block_height,
@@ -132,7 +132,7 @@ impl StoredBlocksWrite {
         ))
     }
 
-    fn push_block2(&mut self, block: StoredBlock) -> anyhow::Result<()> {
+    fn push_block_front2(&mut self, block: StoredBlock) -> anyhow::Result<()> {
         self.head = (self.head + 1) % self.blocks.len();
         anyhow::ensure!(!self.blocks[self.head].exists, "no free slot");
 
@@ -141,13 +141,61 @@ impl StoredBlocksWrite {
         });
 
         self.blocks[self.head] = block;
+        self.update_total(false);
+        Ok(())
+    }
 
-        // update stored if db was initialized
-        if self.tail == 0 && self.head == 0 {
-            self.stored_slots.first_available_store(self.front_slot());
+    pub fn get_first_slot(&self) -> Option<Slot> {
+        // additional condition in case if zero blocks exists
+        if self.blocks[self.tail].exists && self.blocks[self.head].exists {
+            let mut index = self.tail;
+            loop {
+                let block = &self.blocks[index];
+                if block.exists {
+                    return Some(block.slot);
+                }
+                if index == self.head {
+                    break;
+                }
+                index = (index + 1) % self.blocks.len();
+            }
         }
+        None
+    }
 
-        // set total
+    pub fn push_block_back_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
+        self.push_block_back2(StoredBlock::new_dead(slot))
+    }
+
+    pub fn push_block_back_confirmed(
+        &mut self,
+        slot: Slot,
+        block_time: Option<UnixTimestamp>,
+        block_height: Option<Slot>,
+        storage_id: StorageId,
+        offset: u64,
+        block_size: u64,
+    ) -> anyhow::Result<()> {
+        self.push_block_back2(StoredBlock::new_confirmed(
+            slot,
+            block_time,
+            block_height,
+            storage_id,
+            offset,
+            block_size,
+        ))
+    }
+
+    fn push_block_back2(&mut self, block: StoredBlock) -> anyhow::Result<()> {
+        self.tail = self.tail.checked_sub(1).unwrap_or(self.blocks.len() - 1);
+        anyhow::ensure!(!self.blocks[self.tail].exists, "no free slot");
+
+        self.blocks[self.tail] = block;
+        self.update_total(true);
+        Ok(())
+    }
+
+    fn update_total(&self, push_back: bool) {
         let total = if self.head >= self.tail {
             self.head - self.tail + 1
         } else {
@@ -155,37 +203,23 @@ impl StoredBlocksWrite {
         };
         self.stored_slots.set_total(total);
 
-        Ok(())
+        // update stored if db was initialized
+        if push_back || (self.tail == 0 && self.head == 0) {
+            self.stored_slots
+                .first_available_store(self.get_first_slot());
+        }
     }
 
     pub fn pop_block(&mut self) -> Option<StoredBlock> {
         if self.blocks[self.tail].exists {
             let block = std::mem::replace(&mut self.blocks[self.tail], StoredBlock::new_noexists());
             self.tail = (self.tail + 1) % self.blocks.len();
-            self.stored_slots.first_available_store(self.front_slot());
+            self.stored_slots
+                .first_available_store(self.get_first_slot());
             Some(block)
         } else {
             None
         }
-    }
-
-    fn front_slot(&self) -> Option<Slot> {
-        if self.tail == 0 && self.head == self.blocks.len() - 1 {
-            return None;
-        }
-
-        let mut index = self.tail;
-        loop {
-            let block = &self.blocks[index];
-            if block.exists {
-                return Some(block.slot);
-            }
-            if index == self.head {
-                break;
-            }
-            index = (index + 1) % self.blocks.len();
-        }
-        None
     }
 }
 

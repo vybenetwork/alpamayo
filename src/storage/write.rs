@@ -18,10 +18,10 @@ use {
         },
         util::{HashMap, HashSet},
     },
-    anyhow::Context,
+    anyhow::Context as _,
     futures::{
-        future::{FutureExt, pending, try_join_all},
-        stream::{FuturesUnordered, StreamExt},
+        future::try_join_all,
+        stream::{FuturesUnordered, Stream, StreamExt},
     },
     metrics::histogram,
     prost::Message,
@@ -35,7 +35,9 @@ use {
     solana_storage_proto::convert::generated,
     solana_transaction_status::ConfirmedBlock,
     std::{
+        pin::Pin,
         sync::{Arc, Mutex},
+        task::{Context, Poll},
         thread,
         time::Duration,
     },
@@ -54,6 +56,7 @@ pub fn start(
     db_write: RocksdbWrite,
     db_read: RocksdbRead,
     rpc_storage_source: RpcSourceConnected,
+    rpc_concurrency: usize,
     stream_start: Arc<Notify>,
     stream_rx: mpsc::Receiver<StreamSourceMessage>,
     sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
@@ -155,7 +158,9 @@ pub fn start(
                     .context("failed to send read/write init message")?;
 
                 let result = start2(
+                    config.backfilling.map(|config| config.sync_to),
                     stored_slots,
+                    rpc_concurrency,
                     rpc_getblock_max_retries,
                     rpc_getblock_backoff_init,
                     Arc::new(rpc_storage_source),
@@ -179,7 +184,9 @@ pub fn start(
 
 #[allow(clippy::too_many_arguments)]
 async fn start2(
+    mut backfill_upto: Option<Slot>,
     stored_slots: StoredSlots,
+    rpc_concurrency: usize,
     rpc_getblock_max_retries: usize,
     rpc_getblock_backoff_init: Duration,
     rpc: Arc<RpcSourceConnected>,
@@ -191,57 +198,17 @@ async fn start2(
     sync_tx: broadcast::Sender<ReadWriteSyncMessage>,
     shutdown: Shutdown,
 ) -> anyhow::Result<()> {
-    // get block requests
-    let rpc_block_inprogress = Arc::new(Mutex::new(HashSet::<Slot>::default()));
-    let mut rpc_requests = FuturesUnordered::new();
-    #[allow(clippy::type_complexity)]
-    let get_confirmed_block = |rpc_requests: &mut FuturesUnordered<
-        JoinHandle<Result<(u64, Option<BlockWithBinary>), RpcSourceConnectedError<GetBlockError>>>,
-    >,
-                               slot: Slot| {
-        let mut locked = rpc_block_inprogress.lock().expect("unpoisoned");
-        if !locked.insert(slot) {
-            return;
-        }
-
-        let mut max_retries = rpc_getblock_max_retries;
-        let mut backoff_wait = rpc_getblock_backoff_init;
-        let rpc = Arc::clone(&rpc);
-        let rpc_block_inprogress = Arc::clone(&rpc_block_inprogress);
-        rpc_requests.push(spawn_local(async move {
-            let result = loop {
-                match rpc.get_block(slot).await {
-                    Ok(block) => break Ok((slot, Some(block))),
-                    Err(error) => {
-                        if matches!(error, RpcSourceConnectedError::SendError) {
-                            break Err(error);
-                        }
-                        if matches!(
-                            error,
-                            RpcSourceConnectedError::Error(GetBlockError::SlotSkipped(_))
-                        ) {
-                            break Ok((slot, None));
-                        }
-                        if max_retries == 0 {
-                            break Err(error);
-                        }
-                        warn!(?error, slot, max_retries, "failed to get confirmed block");
-                        max_retries -= 1;
-                        sleep(backoff_wait).await;
-                        backoff_wait *= 2;
-                    }
-                }
-            };
-            let mut locked = rpc_block_inprogress.lock().expect("unpoisoned");
-            locked.remove(&slot);
-            result
-        }));
-    };
-
     let metric_storage_block_sync = histogram!(WRITE_BLOCK_SYNC_SECONDS);
 
-    // queue of confirmed blocks
-    let mut queued_slots = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
+    // rpc blocks & queue of confirmed blocks
+    let mut rpc_blocks = RpcBlocks::new(
+        Arc::clone(&rpc),
+        rpc_concurrency,
+        rpc_getblock_max_retries,
+        rpc_getblock_backoff_init,
+    );
+    let mut queued_slots_back = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
+    let mut queued_slots_front = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
 
     // fill the gap between stored and new
     let mut next_confirmed_slot = load_confirmed_slot(&rpc, &stored_slots, &sync_tx).await?;
@@ -271,7 +238,7 @@ async fn start2(
                     slot_db = next_database_slot,
                     slot_node = next_confirmed_slot,
                     diff = next_confirmed_slot - next_database_slot,
-                    slots_per_sec = (next_confirmed_slot - last_confirmed_slot) as f64
+                    sync_rate = (next_confirmed_slot - last_confirmed_slot) as f64
                         / last_confirmed_slot_update_ts.elapsed().as_secs() as f64,
                     "trying to catch-up the node"
                 );
@@ -286,29 +253,23 @@ async fn start2(
             }
 
             // get blocks
-            while next_rpc_request_slot <= next_confirmed_slot && !rpc.is_full() {
-                get_confirmed_block(&mut rpc_requests, next_rpc_request_slot);
+            while next_rpc_request_slot <= next_confirmed_slot && !rpc_blocks.is_full() {
+                rpc_blocks.fetch(next_rpc_request_slot);
                 next_rpc_request_slot += 1;
             }
 
             // push block into the queue
-            match rpc_requests.next().await {
-                Some(Ok(Ok((slot, block)))) => {
+            match rpc_blocks.next().await {
+                Some(Ok((slot, block))) => {
                     if slot >= next_database_slot {
-                        queued_slots.insert(slot, block.map(Arc::new));
+                        queued_slots_front.insert(slot, block.map(Arc::new));
                     }
                 }
-                Some(Ok(Err(RpcSourceConnectedError::SendError))) => return Ok(()),
-                Some(Ok(Err(error))) => {
-                    return Err(error).context("failed to get confirmed block");
-                }
-                Some(Err(error)) => {
-                    return Err(error).context("failed to join spawned task");
-                }
-                None => unreachable!(),
+                Some(Err(error)) => return Err(error),
+                None => return Ok(()),
             }
 
-            while let Some(block) = queued_slots.remove(&next_database_slot) {
+            while let Some(block) = queued_slots_front.remove(&next_database_slot) {
                 let _ = sync_tx.send(ReadWriteSyncMessage::BlockConfirmed {
                     slot: next_database_slot,
                     block: block.clone(),
@@ -316,7 +277,7 @@ async fn start2(
 
                 let ts = Instant::now();
                 db_write
-                    .push_block(next_database_slot, block, storage_files, &mut blocks)
+                    .push_block_front(next_database_slot, block, storage_files, &mut blocks)
                     .await?;
                 metric_storage_block_sync.record(duration_to_seconds(ts.elapsed()));
 
@@ -327,32 +288,27 @@ async fn start2(
     stream_start.notify_one();
 
     let mut storage_memory = StorageMemory::default();
+    let mut next_back_slot = None;
+    let mut next_back_request_slot = Slot::MAX;
+    let mut backfill_ts = None;
 
     tokio::pin!(shutdown);
     loop {
-        let rpc_requests_next = if rpc_requests.is_empty() {
-            pending().boxed_local()
-        } else {
-            rpc_requests.next().boxed_local()
-        };
-
         tokio::select! {
             biased;
             // insert block requested from rpc
-            message = rpc_requests_next => match message {
-                Some(Ok(Ok((slot, block)))) => {
+            message = rpc_blocks.next() => match message {
+                Some(Ok((slot, block))) => {
                     if slot >= next_confirmed_slot {
-                        queued_slots.insert(slot, block.map(Arc::new));
+                        queued_slots_front.insert(slot, block.map(Arc::new));
+                    } else if let Some(next_back_slot) = next_back_slot {
+                        if slot <= next_back_slot {
+                            queued_slots_back.insert(slot, block.map(Arc::new));
+                        }
                     }
-                },
-                Some(Ok(Err(RpcSourceConnectedError::SendError))) => return Ok(()),
-                Some(Ok(Err(error))) => {
-                    return Err(error).context("failed to get confirmed block");
-                },
-                Some(Err(error)) => {
-                    return Err(error).context("failed to join spawned task");
-                },
-                None => unreachable!(),
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok(()),
             },
             // handle new block from the stream
             message = stream_rx.recv() => match message {
@@ -389,19 +345,21 @@ async fn start2(
 
                         if block.get_slot() > next_confirmed_slot {
                             for slot in next_confirmed_slot..block.get_slot() {
-                                get_confirmed_block(&mut rpc_requests, slot);
+                                if !queued_slots_front.contains_key(&slot) {
+                                    rpc_blocks.fetch(slot);
+                                }
                             }
                         }
 
                         match block {
                             MemoryConfirmedBlock::Missed { slot } => {
-                                get_confirmed_block(&mut rpc_requests, slot);
+                                rpc_blocks.fetch(slot);
                             },
                             MemoryConfirmedBlock::Dead { slot } => {
-                                queued_slots.insert(slot, None);
+                                queued_slots_front.insert(slot, None);
                             }
                             MemoryConfirmedBlock::Block { slot, block } => {
-                                queued_slots.insert(slot, Some(block));
+                                queued_slots_front.insert(slot, Some(block));
                             }
                         }
                     }
@@ -411,8 +369,8 @@ async fn start2(
             () = &mut shutdown => return Ok(()),
         }
 
-        // save blocks
-        while let Some(block) = queued_slots.remove(&next_confirmed_slot) {
+        // save new blocks
+        while let Some(block) = queued_slots_front.remove(&next_confirmed_slot) {
             let _ = sync_tx.send(ReadWriteSyncMessage::BlockConfirmed {
                 slot: next_confirmed_slot,
                 block: block.clone(),
@@ -420,11 +378,67 @@ async fn start2(
 
             let ts = Instant::now();
             db_write
-                .push_block(next_confirmed_slot, block, storage_files, &mut blocks)
+                .push_block_front(next_confirmed_slot, block, storage_files, &mut blocks)
                 .await?;
             metric_storage_block_sync.record(duration_to_seconds(ts.elapsed()));
 
             next_confirmed_slot += 1;
+        }
+
+        // backfill
+        match (backfill_upto, next_back_slot) {
+            (Some(backfill_upto_value), Some(mut slot)) => {
+                if next_back_request_slot == Slot::MAX {
+                    next_back_request_slot = slot;
+                }
+
+                if backfill_ts.is_none() {
+                    backfill_ts = Some((slot, Instant::now()));
+                }
+                if let Some((slot2, ts)) = backfill_ts {
+                    if ts.elapsed() > Duration::from_secs(5) {
+                        info!(
+                            sync_to = backfill_upto_value,
+                            left = slot - backfill_upto_value,
+                            added = slot2 - slot,
+                            sync_rate = (slot2 - slot) as f64 / ts.elapsed().as_secs() as f64,
+                            "backfilling progress"
+                        );
+                        backfill_ts = Some((slot, Instant::now()));
+                    }
+                }
+
+                while next_back_request_slot >= backfill_upto_value && !rpc_blocks.is_full() {
+                    rpc_blocks.fetch(next_back_request_slot);
+                    next_back_request_slot -= 1;
+                }
+
+                let tsloop = Instant::now();
+                while let Some(block) = queued_slots_back.remove(&slot) {
+                    let ts = Instant::now();
+                    let block_added = db_write
+                        .push_block_back(slot, block, storage_files, &mut blocks)
+                        .await?;
+                    metric_storage_block_sync.record(duration_to_seconds(ts.elapsed()));
+                    if !block_added {
+                        info!("backfilling is finished");
+                        backfill_upto = None;
+                        break;
+                    }
+
+                    slot -= 1;
+
+                    // do not block new blocks
+                    if tsloop.elapsed() > Duration::from_millis(100) {
+                        break;
+                    }
+                }
+                next_back_slot = Some(slot);
+            }
+            (Some(_), None) => {
+                next_back_slot = blocks.get_first_slot().and_then(|x| x.checked_sub(1));
+            }
+            _ => {}
         }
     }
 }
@@ -444,4 +458,100 @@ async fn load_confirmed_slot(
     }
     info!(elapsed = ?ts.elapsed(), finalized_slot, confirmed_slot, "load finalized & confirmed slots");
     Ok(confirmed_slot)
+}
+
+#[derive(Debug)]
+struct RpcBlocks {
+    rpc: Arc<RpcSourceConnected>,
+    rpc_concurrency: usize,
+    rpc_getblock_max_retries: usize,
+    rpc_getblock_backoff_init: Duration,
+    rpc_inprogress: Mutex<HashSet<Slot>>,
+    #[allow(clippy::type_complexity)]
+    rpc_requests: FuturesUnordered<
+        JoinHandle<Result<(Slot, Option<BlockWithBinary>), RpcSourceConnectedError<GetBlockError>>>,
+    >,
+}
+
+impl RpcBlocks {
+    fn new(
+        rpc: Arc<RpcSourceConnected>,
+        rpc_concurrency: usize,
+        rpc_getblock_max_retries: usize,
+        rpc_getblock_backoff_init: Duration,
+    ) -> Self {
+        Self {
+            rpc,
+            rpc_concurrency,
+            rpc_getblock_max_retries,
+            rpc_getblock_backoff_init,
+            rpc_inprogress: Mutex::default(),
+            rpc_requests: FuturesUnordered::default(),
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.rpc_requests.len() >= self.rpc_concurrency
+    }
+
+    fn fetch(&self, slot: Slot) {
+        let mut locked = self.rpc_inprogress.lock().expect("unpoisoned");
+        if !locked.insert(slot) {
+            return;
+        }
+
+        let rpc = Arc::clone(&self.rpc);
+        let mut max_retries = self.rpc_getblock_max_retries;
+        let mut backoff_wait = self.rpc_getblock_backoff_init;
+        self.rpc_requests.push(spawn_local(async move {
+            loop {
+                match rpc.get_block(slot).await {
+                    Ok(block) => break Ok((slot, Some(block))),
+                    Err(error) => {
+                        if matches!(error, RpcSourceConnectedError::SendError) {
+                            break Err(error);
+                        }
+                        if matches!(
+                            error,
+                            RpcSourceConnectedError::Error(GetBlockError::SlotSkipped(_))
+                        ) {
+                            break Ok((slot, None));
+                        }
+                        if max_retries == 0 {
+                            break Err(error);
+                        }
+                        warn!(?error, slot, max_retries, "failed to get confirmed block");
+                        max_retries -= 1;
+                        sleep(backoff_wait).await;
+                        backoff_wait *= 2;
+                    }
+                }
+            }
+        }));
+    }
+}
+
+impl Stream for RpcBlocks {
+    type Item = anyhow::Result<(Slot, Option<BlockWithBinary>)>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.rpc_requests.is_empty() {
+            Poll::Pending
+        } else {
+            Poll::Ready(Some(
+                match futures::ready!(self.rpc_requests.poll_next_unpin(cx)) {
+                    Some(Ok(Ok((slot, block)))) => {
+                        let mut locked = self.rpc_inprogress.lock().expect("unpoisoned");
+                        locked.remove(&slot);
+
+                        Ok((slot, block))
+                    }
+                    Some(Ok(Err(RpcSourceConnectedError::SendError))) => return Poll::Ready(None),
+                    Some(Ok(Err(error))) => Err(error).context("failed to get confirmed block"),
+                    Some(Err(error)) => Err(error).context("failed to join spawned task"),
+                    None => unreachable!(),
+                },
+            ))
+        }
+    }
 }
