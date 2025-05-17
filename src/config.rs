@@ -207,11 +207,6 @@ pub struct ConfigStorageRocksdb {
     #[serde(default)]
     pub index_sfa_compression: ConfigStorageRocksdbCompression,
     #[serde(
-        default = "ConfigStorageRocksdb::default_read_channel_size",
-        deserialize_with = "deserialize_num_str"
-    )]
-    pub read_channel_size: usize,
-    #[serde(
         default = "ConfigStorageRocksdb::default_read_workers",
         deserialize_with = "deserialize_num_str"
     )]
@@ -219,10 +214,6 @@ pub struct ConfigStorageRocksdb {
 }
 
 impl ConfigStorageRocksdb {
-    fn default_read_channel_size() -> usize {
-        num_cpus::get() * 5
-    }
-
     fn default_read_workers() -> usize {
         num_cpus::get()
     }
@@ -272,7 +263,9 @@ pub struct ConfigStorageRead {
     #[serde(deserialize_with = "deserialize_affinity")]
     pub affinity: Option<Vec<usize>>,
     #[serde(deserialize_with = "deserialize_num_str")]
-    pub requests_concurrency: usize,
+    pub thread_max_async_requests: usize,
+    #[serde(deserialize_with = "deserialize_num_str")]
+    pub thread_max_files_requests: usize,
 }
 
 impl Default for ConfigStorageRead {
@@ -280,7 +273,8 @@ impl Default for ConfigStorageRead {
         Self {
             threads: 2,
             affinity: None,
-            requests_concurrency: 128,
+            thread_max_async_requests: 1024,
+            thread_max_files_requests: 32,
         }
     }
 }
