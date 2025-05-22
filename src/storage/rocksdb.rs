@@ -930,6 +930,16 @@ impl RocksdbWrite {
                 "trying to push invalid slot: {slot}, expected {next_slot}"
             );
         }
+        if let Some(first_height) = blocks.get_first_height() {
+            if let Some(block) = &block {
+                let block_height = block.block_height.expect("should have height");
+                anyhow::ensure!(
+                    block_height + 1 == first_height,
+                    "trying to push block with invalid height: {block_height}, expected {}",
+                    first_height - 1
+                );
+            }
+        }
 
         // make sure that we not reached blocks limit
         if blocks.is_full() {
@@ -1012,6 +1022,16 @@ impl RocksdbWrite {
                 next_slot == slot,
                 "trying to push invalid slot: {slot}, expected {next_slot}"
             );
+        }
+        if let Some(latest_height) = blocks.get_latest_height() {
+            if let Some(block) = &block {
+                let block_height = block.block_height.expect("should have height");
+                anyhow::ensure!(
+                    latest_height + 1 == block_height,
+                    "trying to push block with invalid height: {block_height}, expected {}",
+                    latest_height + 1
+                );
+            }
         }
 
         // get some space if we reached blocks limit

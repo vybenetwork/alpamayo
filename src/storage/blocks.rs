@@ -109,6 +109,20 @@ impl StoredBlocksWrite {
         block.exists.then_some(block.slot)
     }
 
+    pub fn get_latest_height(&self) -> Option<Slot> {
+        let mut index = self.head;
+        loop {
+            let block = self.blocks[index];
+            if block.exists && !block.dead {
+                return block.block_height;
+            }
+            if index == self.tail {
+                return None;
+            }
+            index = index.checked_sub(1).unwrap_or(self.blocks.len() - 1);
+        }
+    }
+
     pub fn push_block_front_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
         self.push_block_front2(StoredBlock::new_dead(slot))
     }
@@ -145,14 +159,14 @@ impl StoredBlocksWrite {
         Ok(())
     }
 
-    pub fn get_first_slot(&self) -> Option<Slot> {
+    fn get_first(&self, filter: impl Fn(&StoredBlock) -> bool) -> Option<&StoredBlock> {
         // additional condition in case if zero blocks exists
         if self.blocks[self.tail].exists && self.blocks[self.head].exists {
             let mut index = self.tail;
             loop {
                 let block = &self.blocks[index];
-                if block.exists {
-                    return Some(block.slot);
+                if filter(block) {
+                    return Some(block);
                 }
                 if index == self.head {
                     break;
@@ -161,6 +175,15 @@ impl StoredBlocksWrite {
             }
         }
         None
+    }
+
+    pub fn get_first_slot(&self) -> Option<Slot> {
+        self.get_first(|blk| blk.exists).map(|blk| blk.slot)
+    }
+
+    pub fn get_first_height(&self) -> Option<Slot> {
+        self.get_first(|blk| blk.exists && !blk.dead)
+            .and_then(|blk| blk.block_height)
     }
 
     pub fn push_block_back_dead(&mut self, slot: Slot) -> anyhow::Result<()> {
