@@ -7,7 +7,7 @@ use {
             files::{StorageFilesWrite, StorageId},
             sync::ReadWriteSyncMessage,
         },
-        util::HashMap,
+        util::{HashMap, VecSide},
     },
     anyhow::Context,
     bitflags::bitflags,
@@ -927,7 +927,7 @@ impl RocksdbWrite {
         if let Some(next_slot) = blocks.get_first_slot().map(|slot| slot - 1) {
             anyhow::ensure!(
                 next_slot == slot,
-                "trying to push invalid slot: {slot}, expected {next_slot}"
+                "trying to push back invalid slot: {slot}, expected {next_slot}"
             );
         }
         if let Some(first_height) = blocks.get_first_height() {
@@ -935,7 +935,7 @@ impl RocksdbWrite {
                 let block_height = block.block_height.expect("should have height");
                 anyhow::ensure!(
                     block_height + 1 == first_height,
-                    "trying to push block with invalid height: {block_height}, expected {}",
+                    "trying to push back block with invalid height: {block_height}, expected {}",
                     first_height - 1
                 );
             }
@@ -1020,7 +1020,7 @@ impl RocksdbWrite {
         if let Some(next_slot) = blocks.get_latest_slot().map(|slot| slot + 1) {
             anyhow::ensure!(
                 next_slot == slot,
-                "trying to push invalid slot: {slot}, expected {next_slot}"
+                "trying to push front invalid slot: {slot}, expected {next_slot}"
             );
         }
         if let Some(latest_height) = blocks.get_latest_height() {
@@ -1028,7 +1028,7 @@ impl RocksdbWrite {
                 let block_height = block.block_height.expect("should have height");
                 anyhow::ensure!(
                     latest_height + 1 == block_height,
-                    "trying to push block with invalid height: {block_height}, expected {}",
+                    "trying to push front block with invalid height: {block_height}, expected {}",
                     latest_height + 1
                 );
             }
@@ -1036,7 +1036,7 @@ impl RocksdbWrite {
 
         // get some space if we reached blocks limit
         if blocks.is_full() {
-            self.pop_block(files, blocks).await?;
+            self.pop_block_back(files, blocks).await?;
         }
 
         // store dead slot
@@ -1072,7 +1072,7 @@ impl RocksdbWrite {
                         return Ok((storage_id, offset, buffer, blocks));
                     }
 
-                    self.pop_block(files, blocks).await?;
+                    self.pop_block_back(files, blocks).await?;
                 }
             },
             async move {
@@ -1113,15 +1113,38 @@ impl RocksdbWrite {
         )
     }
 
-    async fn pop_block(
+    async fn pop_block_back(
         &self,
         files: &mut StorageFilesWrite,
         blocks: &mut StoredBlocksWrite,
     ) -> anyhow::Result<()> {
-        let Some(block) = blocks.pop_block() else {
-            anyhow::bail!("no blocks to remove");
+        self.pop_block(files, blocks, VecSide::Back).await
+    }
+
+    pub async fn pop_block_front(
+        &self,
+        files: &mut StorageFilesWrite,
+        blocks: &mut StoredBlocksWrite,
+    ) -> anyhow::Result<()> {
+        self.pop_block(files, blocks, VecSide::Front).await
+    }
+
+    async fn pop_block(
+        &self,
+        files: &mut StorageFilesWrite,
+        blocks: &mut StoredBlocksWrite,
+        side: VecSide,
+    ) -> anyhow::Result<()> {
+        let Some(block) = (match side {
+            VecSide::Back => blocks.pop_block_back(),
+            VecSide::Front => blocks.pop_block_front(),
+        }) else {
+            anyhow::bail!("no blocks to remove from front");
         };
-        let _ = self.sync_tx.send(ReadWriteSyncMessage::ConfirmedBlockPop);
+        let _ = self.sync_tx.send(match side {
+            VecSide::Back => ReadWriteSyncMessage::ConfirmedBlockPopBack,
+            VecSide::Front => ReadWriteSyncMessage::ConfirmedBlockPopFront,
+        });
 
         // remove from db
         let (tx, rx) = oneshot::channel();
@@ -1139,7 +1162,10 @@ impl RocksdbWrite {
         if block.size == 0 {
             Ok(())
         } else {
-            files.pop_block(block)
+            match side {
+                VecSide::Back => files.pop_block_back(block),
+                VecSide::Front => files.pop_block_front(block),
+            }
         }
     }
 }

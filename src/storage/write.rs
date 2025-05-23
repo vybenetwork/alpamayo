@@ -51,6 +51,7 @@ use {
 
 #[allow(clippy::too_many_arguments)]
 pub fn start(
+    pop_slots_front: Option<usize>,
     config: ConfigStorage,
     stored_slots: StoredSlots,
     db_write: RocksdbWrite,
@@ -158,6 +159,7 @@ pub fn start(
                     .context("failed to send read/write init message")?;
 
                 let result = start2(
+                    pop_slots_front,
                     config.backfilling.map(|config| config.sync_to),
                     stored_slots,
                     rpc_concurrency,
@@ -184,6 +186,7 @@ pub fn start(
 
 #[allow(clippy::too_many_arguments)]
 async fn start2(
+    pop_slots_front: Option<usize>,
     mut backfill_upto: Option<Slot>,
     stored_slots: StoredSlots,
     rpc_concurrency: usize,
@@ -210,6 +213,19 @@ async fn start2(
     let mut queued_slots_back = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
     let mut queued_slots_front = HashMap::<Slot, Option<Arc<BlockWithBinary>>>::default();
 
+    // revert slots, if required
+    if let Some(slots) = pop_slots_front {
+        for _ in 0..slots {
+            let Some(slot) = blocks.get_latest_slot() else {
+                break;
+            };
+
+            let ts = Instant::now();
+            db_write.pop_block_front(storage_files, &mut blocks).await?;
+            info!(slot, elapsed = ?ts.elapsed(), "pop slot");
+        }
+    }
+
     // fill the gap between stored and new
     let mut next_confirmed_slot = load_confirmed_slot(&rpc, &stored_slots, &sync_tx).await?;
     if let Some(slot) = blocks.get_latest_slot() {
@@ -217,7 +233,7 @@ async fn start2(
         let mut next_rpc_request_slot = slot + 1;
         let mut next_database_slot = slot + 1;
         info!(
-            slot_db = next_database_slot,
+            next_database_slot,
             slot_node = next_confirmed_slot,
             diff = next_confirmed_slot - next_database_slot,
             "initiate node catch-up process"
