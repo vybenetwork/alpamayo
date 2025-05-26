@@ -102,17 +102,19 @@ impl RpcSource {
     }
 
     pub async fn get_confirmed_slot(&self) -> Result<Slot, ClientError> {
-        let _permit = self.semaphore.acquire().await.expect("unclosed");
         self.client
             .get_slot_with_commitment(CommitmentConfig::confirmed())
             .await
     }
 
     pub async fn get_finalized_slot(&self) -> Result<Slot, ClientError> {
-        let _permit = self.semaphore.acquire().await.expect("unclosed");
         self.client
             .get_slot_with_commitment(CommitmentConfig::finalized())
             .await
+    }
+
+    pub async fn get_first_available_block(&self) -> Result<Slot, ClientError> {
+        self.client.get_first_available_block().await
     }
 
     pub async fn get_block(&self, slot: Slot) -> Result<BlockWithBinary, GetBlockError> {
