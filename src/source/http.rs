@@ -40,6 +40,7 @@ use {
     url::{ParseError, Url},
 };
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Error)]
 pub enum ConnectError {
     #[error(transparent)]
@@ -50,6 +51,7 @@ pub enum ConnectError {
     Client(#[from] ClientError),
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Error)]
 pub enum GetBlockError {
     #[error(transparent)]
@@ -333,6 +335,7 @@ impl HttpSource {
                 .map(Self::tx_meta_return_data_conv)
                 .transpose()?,
             compute_units_consumed: meta.compute_units_consumed.into(),
+            cost_units: meta.cost_units.into(),
         })
     }
 
