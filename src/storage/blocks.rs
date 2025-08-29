@@ -355,23 +355,19 @@ impl StoredBlocksRead {
                 break;
             }
             if block.dead {
+                index = (index + 1) % self.blocks.len();
                 continue;
             }
 
-            if let RpcRequestBlocksUntil::Limit(limit) = until
-                && blocks.len() == limit
-            {
-                break;
-            }
-
             blocks.push(block.slot);
-            index = (index + 1) % self.blocks.len();
 
-            if let RpcRequestBlocksUntil::EndSlot(end_slot) = until
-                && end_slot == block.slot
-            {
-                break;
+            match until {
+                RpcRequestBlocksUntil::EndSlot(end_slot) if end_slot == block.slot => break,
+                RpcRequestBlocksUntil::Limit(limit) if blocks.len() == limit => break,
+                _ => {}
             }
+
+            index = (index + 1) % self.blocks.len();
         }
 
         Ok(blocks)
