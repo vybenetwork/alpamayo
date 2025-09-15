@@ -1,6 +1,6 @@
 use {
     crate::{
-        config::ConfigRpcUpstream,
+        config::{ConfigRpcCallJson, ConfigRpcUpstream},
         metrics::RPC_UPSTREAM_REQUESTS_TOTAL,
         rpc::{
             api::{X_ERROR, X_SLOT},
@@ -32,6 +32,7 @@ use {
     solana_transaction_status::{BlockEncodingOptions, UiConfirmedBlock, UiTransactionEncoding},
     std::{
         borrow::Cow,
+        collections::HashSet,
         sync::Arc,
         time::{Duration, Instant},
     },
@@ -41,6 +42,8 @@ use {
 
 #[derive(Debug)]
 pub struct RpcClientHttpget {
+    calls: HashSet<ConfigRpcCallJson>,
+    name: Arc<str>,
     client: Client,
     url: Url,
     version: Version,
@@ -54,10 +57,16 @@ impl RpcClientHttpget {
             .build()?;
 
         Ok(Self {
+            calls: config.calls,
+            name: config.name.into(),
             client,
             url: config.endpoint.parse()?,
             version: config.version,
         })
+    }
+
+    pub fn is_supported(&self, call: ConfigRpcCallJson) -> bool {
+        self.calls.contains(&call)
     }
 
     pub async fn get_block(
@@ -69,6 +78,7 @@ impl RpcClientHttpget {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getBlock_rest",
         )
         .increment(1);
@@ -92,6 +102,7 @@ impl RpcClientHttpget {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getTransaction_rest",
         )
         .increment(1);
@@ -245,6 +256,8 @@ type CachedEpochSchedule =
 #[derive(Debug)]
 pub struct RpcClientJsonrpc {
     inner: Arc<RpcClientJsonrpcInner>,
+    calls: HashSet<ConfigRpcCallJson>,
+    name: Arc<str>,
     cache_cluster_nodes: CachedRequests<Vec<RpcContactInfo>>,
     cache_epoch_schedule: Arc<Mutex<HashMap<Epoch, CachedEpochSchedule>>>,
 }
@@ -262,9 +275,15 @@ impl RpcClientJsonrpc {
                 endpoint: config.endpoint,
                 version: config.version,
             }),
+            calls: config.calls,
+            name: config.name.into(),
             cache_cluster_nodes: CachedRequests::new(gcn_cache_ttl),
             cache_epoch_schedule: Arc::default(),
         })
+    }
+
+    pub fn is_supported(&self, call: ConfigRpcCallJson) -> bool {
+        self.calls.contains(&call)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -281,6 +300,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getBlock",
         )
         .increment(1);
@@ -358,6 +378,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => method,
         )
         .increment(1);
@@ -424,6 +445,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getBlockTime",
         )
         .increment(1);
@@ -452,6 +474,7 @@ impl RpcClientJsonrpc {
         id: Id<'static>,
     ) -> RpcClientJsonrpcResult {
         let inner = Arc::clone(&self.inner);
+        let upstream_name = Arc::clone(&self.name);
         let payload = self
             .cache_cluster_nodes
             .get(deadline, move || {
@@ -466,6 +489,7 @@ impl RpcClientJsonrpc {
                     counter!(
                         RPC_UPSTREAM_REQUESTS_TOTAL,
                         "x_subscription_id" => x_subscription_id,
+                        "upstream" => upstream_name,
                         "method" => "getClusterNodes",
                     )
                     .increment(1);
@@ -488,6 +512,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getFirstAvailableBlock",
         )
         .increment(1);
@@ -524,6 +549,7 @@ impl RpcClientJsonrpc {
             counter!(
                 RPC_UPSTREAM_REQUESTS_TOTAL,
                 "x_subscription_id" => Arc::clone(&x_subscription_id),
+                "upstream" => Arc::clone(&self.name),
                 "method" => "getLeaderSchedule",
             )
             .increment(1);
@@ -561,6 +587,7 @@ impl RpcClientJsonrpc {
             })
             .unwrap_or_else(|| {
                 let inner = Arc::clone(&self.inner);
+                let upstream_name = Arc::clone(&self.name);
                 let fut = async move {
                     let result = inner
                         .call_get_success::<Option<RpcLeaderSchedule>>(
@@ -579,6 +606,7 @@ impl RpcClientJsonrpc {
                     counter!(
                         RPC_UPSTREAM_REQUESTS_TOTAL,
                         "x_subscription_id" => x_subscription_id,
+                        "upstream" => upstream_name,
                         "method" => "getLeaderSchedule",
                     )
                     .increment(1);
@@ -630,6 +658,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getSignaturesForAddress",
         )
         .increment(1);
@@ -669,6 +698,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getSignatureStatuses",
         )
         .increment(1);
@@ -706,6 +736,7 @@ impl RpcClientJsonrpc {
         counter!(
             RPC_UPSTREAM_REQUESTS_TOTAL,
             "x_subscription_id" => Arc::clone(&x_subscription_id),
+            "upstream" => Arc::clone(&self.name),
             "method" => "getTransaction",
         )
         .increment(1);
